@@ -5,11 +5,10 @@
 
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-from __future__ import absolute_import, division, print_function
-__metaclass__ = type
+from __future__ import annotations
 
 
-DOCUMENTATION = '''
+DOCUMENTATION = """
 ---
 module: apt_key
 author:
@@ -19,6 +18,10 @@ short_description: Add or remove an apt key
 description:
     - Add or remove an I(apt) key, optionally downloading it.
 extends_documentation_fragment: action_common_attributes
+deprecated:
+    alternative: ansible.builtin.deb822_repository
+    why: The M(ansible.builtin.apt_key) module is deprecated in favor of the M(ansible.builtin.deb822_repository) module.
+    removed_in: "2.25"
 attributes:
     check_mode:
         support: full
@@ -27,13 +30,15 @@ attributes:
     platform:
         platforms: debian
 notes:
-    - The apt-key command used by this module has been deprecated. See the L(Debian wiki,https://wiki.debian.org/DebianRepository/UseThirdParty) for details.
-      This module is kept for backwards compatibility for systems that still use apt-key as the main way to manage apt repository keys.
+    - The C(apt-key) command used by this module has been deprecated. See the L(Debian wiki,https://wiki.debian.org/DebianRepository/UseThirdParty) for details.
+      This module is kept for backwards compatibility for systems that still use C(apt-key) as the main way to manage apt repository keys.
     - As a sanity check, downloaded key id must match the one specified.
     - "Use full fingerprint (40 characters) key ids to avoid key collisions.
       To generate a full-fingerprint imported key: C(apt-key adv --list-public-keys --with-fingerprint --with-colons)."
-    - If you specify both the key id and the URL with O(state=present), the task can verify or add the key as needed.
-    - Adding a new key requires an apt cache update (e.g. using the M(ansible.builtin.apt) module's update_cache option).
+    - If you specify both the key O(id) and the O(url) with O(state=present), the task can verify or add the key as needed.
+    - Adding a new key requires an apt cache update (e.g. using the M(ansible.builtin.apt) module's C(update_cache) option).
+    - The C(apt-key) utility has been deprecated and removed in modern debian versions, use M(ansible.builtin.deb822_repository) as an alternative
+      to M(ansible.builtin.apt_repository) + apt_key combinations.
 requirements:
     - gpg
 seealso:
@@ -43,7 +48,7 @@ options:
         description:
             - The identifier of the key.
             - Including this allows check mode to correctly report the changed state.
-            - If specifying a subkey's id be aware that apt-key does not understand how to remove keys via a subkey id.  Specify the primary key's id instead.
+            - If specifying a subkey's id be aware that apt-key does not understand how to remove keys via a subkey id. Specify the primary key's id instead.
             - This parameter is required when O(state) is set to V(absent).
         type: str
     data:
@@ -80,9 +85,9 @@ options:
               on personally controlled sites using self-signed certificates.
         type: bool
         default: 'yes'
-'''
+"""
 
-EXAMPLES = '''
+EXAMPLES = """
 - name: One way to avoid apt_key once it is removed from your distro, armored keys should use .asc extension, binary should use .gpg
   block:
     - name: somerepo | no apt key
@@ -134,16 +139,16 @@ EXAMPLES = '''
     id: 9FED2BCBDCD29CDF762678CBAED4B06F473041FA
     file: /tmp/apt.gpg
     state: present
-'''
+"""
 
-RETURN = '''
+RETURN = """
 after:
     description: List of apt key ids or fingerprints after any modification
     returned: on change
     type: list
     sample: ["D8576A8BA88D21E9", "3B4FE6ACC0B21F32", "D94AA3F0EFE21092", "871920D1991BC93C"]
 before:
-    description: List of apt key ids or fingprints before any modifications
+    description: List of apt key ids or fingerprints before any modifications
     returned: always
     type: list
     sample: ["3B4FE6ACC0B21F32", "D94AA3F0EFE21092", "871920D1991BC93C"]
@@ -167,17 +172,14 @@ short_id:
     returned: always
     type: str
     sample: "A88D21E9"
-'''
+"""
 
 import os
-
-# FIXME: standardize into module_common
-from traceback import format_exc
 
 from ansible.module_utils.common.text.converters import to_native
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.common.locale import get_best_parsable_locale
-from ansible.module_utils.urls import fetch_url
+from ansible.module_utils.urls import fetch_url, is_fetch_success
 
 
 apt_key_bin = None
@@ -189,7 +191,7 @@ def lang_env(module):
 
     if not hasattr(lang_env, 'result'):
         locale = get_best_parsable_locale(module)
-        lang_env.result = dict(LANG=locale, LC_ALL=locale, LC_MESSAGES=locale)
+        lang_env.result = dict(LANG=locale, LC_ALL=locale, LC_MESSAGES=locale, LANGUAGE=locale)
 
     return lang_env.result
 
@@ -197,8 +199,16 @@ def lang_env(module):
 def find_needed_binaries(module):
     global apt_key_bin
     global gpg_bin
-    apt_key_bin = module.get_bin_path('apt-key', required=True)
-    gpg_bin = module.get_bin_path('gpg', required=True)
+
+    try:
+        apt_key_bin = module.get_bin_path('apt-key', required=True)
+    except ValueError as e:
+        module.exit_json(f'{to_native(e)}. Apt-key has been deprecated. See the deb822_repository as an alternative.')
+
+    try:
+        gpg_bin = module.get_bin_path('gpg', required=True)
+    except ValueError as e:
+        module.exit_json(msg=to_native(e))
 
 
 def add_http_proxy(cmd):
@@ -306,12 +316,12 @@ def download_key(module, url):
     try:
         # note: validate_certs and other args are pulled from module directly
         rsp, info = fetch_url(module, url, use_proxy=True)
-        if info['status'] != 200:
+        if not is_fetch_success(info):
             module.fail_json(msg="Failed to download key at %s: %s" % (url, info['msg']))
 
         return rsp.read()
     except Exception:
-        module.fail_json(msg="error getting key id from url: %s" % url, traceback=format_exc())
+        module.fail_json(msg=f"Error getting key id from url: {url}")
 
 
 def get_key_id_from_file(module, filename, data=None):

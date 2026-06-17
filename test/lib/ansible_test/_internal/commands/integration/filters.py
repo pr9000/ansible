@@ -1,4 +1,5 @@
 """Logic for filtering out integration test targets which are unsupported for the currently provided arguments and available hosts."""
+
 from __future__ import annotations
 
 import abc
@@ -39,13 +40,8 @@ from ...host_profiles import (
     HostProfile,
 )
 
-THostConfig = t.TypeVar('THostConfig', bound=HostConfig)
-TPosixConfig = t.TypeVar('TPosixConfig', bound=PosixConfig)
-TRemoteConfig = t.TypeVar('TRemoteConfig', bound=RemoteConfig)
-THostProfile = t.TypeVar('THostProfile', bound=HostProfile)
 
-
-class TargetFilter(t.Generic[THostConfig], metaclass=abc.ABCMeta):
+class TargetFilter[THostConfig: HostConfig](metaclass=abc.ABCMeta):
     """Base class for target filters."""
 
     def __init__(self, args: IntegrationConfig, configs: list[THostConfig], controller: bool) -> None:
@@ -58,6 +54,11 @@ class TargetFilter(t.Generic[THostConfig], metaclass=abc.ABCMeta):
         self.include_targets = args.include
         self.allow_root = args.allow_root
         self.allow_destructive = args.allow_destructive
+
+    @property
+    def is_managed(self) -> bool:
+        """True if all configs are managed, otherwise False."""
+        return all(config.is_managed for config in self.configs)
 
     @property
     def config(self) -> THostConfig:
@@ -91,7 +92,7 @@ class TargetFilter(t.Generic[THostConfig], metaclass=abc.ABCMeta):
         exclude.update(skipped)
         display.warning(f'Excluding {self.host_type} tests marked {marked} {reason}: {", ".join(skipped)}')
 
-    def filter_profiles(self, profiles: list[THostProfile], target: IntegrationTarget) -> list[THostProfile]:
+    def filter_profiles[THostProfile: HostProfile](self, profiles: list[THostProfile], target: IntegrationTarget) -> list[THostProfile]:
         """Filter the list of profiles, returning only those which are not skipped for the given target."""
         del target
         return profiles
@@ -108,7 +109,7 @@ class TargetFilter(t.Generic[THostConfig], metaclass=abc.ABCMeta):
             elif reason == FallbackReason.PYTHON:
                 display.warning(f'Some {self.host_type} tests may be redundant since a fallback python is in use: {", ".join(affected_targets)}')
 
-        if not self.allow_destructive and not self.config.is_managed:
+        if not self.allow_destructive and not self.is_managed:
             override_destructive = set(target for target in self.include_targets if target.startswith('destructive/'))
             override = [target.name for target in targets if override_destructive & set(target.aliases)]
 
@@ -137,7 +138,7 @@ class TargetFilter(t.Generic[THostConfig], metaclass=abc.ABCMeta):
             self.skip('unstable', 'which require --allow-unstable or prefixing with "unstable/"', targets, exclude, override)
 
 
-class PosixTargetFilter(TargetFilter[TPosixConfig]):
+class PosixTargetFilter[TPosixConfig: PosixConfig](TargetFilter[TPosixConfig]):
     """Target filter for POSIX hosts."""
 
     def filter_targets(self, targets: list[IntegrationTarget], exclude: set[str]) -> None:
@@ -168,10 +169,10 @@ class PosixSshTargetFilter(PosixTargetFilter[PosixSshConfig]):
     """Target filter for POSIX SSH hosts."""
 
 
-class RemoteTargetFilter(TargetFilter[TRemoteConfig]):
+class RemoteTargetFilter[TRemoteConfig: RemoteConfig](TargetFilter[TRemoteConfig]):
     """Target filter for remote Ansible Core CI managed hosts."""
 
-    def filter_profiles(self, profiles: list[THostProfile], target: IntegrationTarget) -> list[THostProfile]:
+    def filter_profiles[THostProfile: HostProfile](self, profiles: list[THostProfile], target: IntegrationTarget) -> list[THostProfile]:
         """Filter the list of profiles, returning only those which are not skipped for the given target."""
         profiles = super().filter_profiles(profiles, target)
 

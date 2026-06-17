@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import traceback
+import typing as t
 import warnings
 
 from collections import OrderedDict
@@ -65,18 +66,17 @@ def setup_collection_loader():
 setup_collection_loader()
 
 from ansible import __version__ as ansible_version
-from ansible.executor.module_common import REPLACER_WINDOWS, NEW_STYLE_PYTHON_MODULE_RE
+from ansible.executor.module_common import REPLACER_WINDOWS as _REPLACER_WINDOWS, NEW_STYLE_PYTHON_MODULE_RE
 from ansible.module_utils.common.collections import is_iterable
 from ansible.module_utils.common.parameters import DEFAULT_TYPE_VALIDATORS
 from ansible.module_utils.compat.version import StrictVersion, LooseVersion
 from ansible.module_utils.basic import to_bytes
-from ansible.module_utils.six import PY3, with_metaclass, string_types
 from ansible.plugins.loader import fragment_loader
 from ansible.plugins.list import IGNORE as REJECTLIST
-from ansible.utils.plugin_docs import add_collection_to_versions_and_dates, add_fragments, get_docstring
+from ansible.utils.plugin_docs import AnsibleFragmentError, add_collection_to_versions_and_dates, add_fragments, get_docstring
 from ansible.utils.version import SemanticVersion
 
-from .module_args import AnsibleModuleImportError, AnsibleModuleNotInitialized, get_argument_spec
+from .module_args import AnsibleModuleImportError, AnsibleModuleNotInitialized, get_py_argument_spec, get_ps_argument_spec
 
 from .schema import (
     ansible_module_kwargs_schema,
@@ -86,50 +86,25 @@ from .schema import (
 
 from .utils import CaptureStd, NoArgsAnsibleModule, compare_unordered_lists, parse_yaml, parse_isodate
 
-
-if PY3:
-    # Because there is no ast.TryExcept in Python 3 ast module
-    TRY_EXCEPT = ast.Try
-    # REPLACER_WINDOWS from ansible.executor.module_common is byte
-    # string but we need unicode for Python 3
-    REPLACER_WINDOWS = REPLACER_WINDOWS.decode('utf-8')
-else:
-    TRY_EXCEPT = ast.TryExcept
-
-REJECTLIST_DIRS = frozenset(('.git', 'test', '.github', '.idea'))
-INDENT_REGEX = re.compile(r'([\t]*)')
-TYPE_REGEX = re.compile(r'.*(if|or)(\s+[^"\']*|\s+)(?<!_)(?<!str\()type\([^)].*')
-SYS_EXIT_REGEX = re.compile(r'[^#]*sys.exit\s*\(.*')
-NO_LOG_REGEX = re.compile(r'(?:pass(?!ive)|secret|token|key)', re.I)
+from .constants import (
+    REJECTLIST_DIRS,
+    SYS_EXIT_REGEX,
+    NO_LOG_REGEX,
+    FORBIDDEN_DICTIONARY_KEYS,
+    REJECTLIST_IMPORTS,
+    PLUGINS_WITH_RETURN_VALUES,
+    PLUGINS_WITH_EXAMPLES,
+    PLUGINS_WITH_YAML_EXAMPLES,
+)
 
 
-REJECTLIST_IMPORTS = {
-    'requests': {
-        'new_only': True,
-        'error': {
-            'code': 'use-module-utils-urls',
-            'msg': ('requests import found, should use '
-                    'ansible.module_utils.urls instead')
-        }
-    },
-    r'boto(?:\.|$)': {
-        'new_only': True,
-        'error': {
-            'code': 'use-boto3',
-            'msg': 'boto import found, new modules should use boto3'
-        }
-    },
-}
-SUBPROCESS_REGEX = re.compile(r'subprocess\.Po.*')
-OS_CALL_REGEX = re.compile(r'os\.call.*')
-
+# Because there is no ast.TryExcept in Python 3 ast module
+TRY_EXCEPT = ast.Try
+# REPLACER_WINDOWS from ansible.executor.module_common is byte
+# string but we need unicode for Python 3
+REPLACER_WINDOWS = _REPLACER_WINDOWS.decode('utf-8')
 
 LOOSE_ANSIBLE_VERSION = LooseVersion('.'.join(ansible_version.split('.')[:3]))
-
-
-PLUGINS_WITH_RETURN_VALUES = ('module', )
-PLUGINS_WITH_EXAMPLES = ('module', )
-PLUGINS_WITH_YAML_EXAMPLES = ('module', )
 
 
 def is_potential_secret_option(option_name):
@@ -269,7 +244,7 @@ class Reporter:
         return 3 if sum(ret) else 0
 
 
-class Validator(with_metaclass(abc.ABCMeta, object)):
+class Validator(metaclass=abc.ABCMeta):
     """Validator instances are intended to be run on a single object.  if you
     are scanning multiple objects for problems, you'll want to have a separate
     Validator for each one."""
@@ -316,8 +291,8 @@ class ModuleValidator(Validator):
 
         self.analyze_arg_spec = analyze_arg_spec and plugin_type == 'module'
 
-        self._Version = LooseVersion
-        self._StrictVersion = StrictVersion
+        self._Version: type[LooseVersion | SemanticVersion] = LooseVersion
+        self._StrictVersion: type[StrictVersion | SemanticVersion] = StrictVersion
 
         self.collection = collection
         self.collection_name = 'ansible.builtin'
@@ -334,8 +309,6 @@ class ModuleValidator(Validator):
 
         self.git_cache = git_cache
         self.base_module = self.git_cache.get_original_path(self.path)
-
-        self._python_module_override = False
 
         with open(path) as f:
             self.text = f.read()
@@ -383,7 +356,7 @@ class ModuleValidator(Validator):
         pass
 
     def _python_module(self):
-        if self.path.endswith('.py') or self._python_module_override:
+        if self.path.endswith('.py'):
             return True
         return False
 
@@ -421,7 +394,7 @@ class ModuleValidator(Validator):
         return self.git_cache.is_new(self.path)
 
     def _check_interpreter(self, powershell=False):
-        if powershell:
+        if self._powershell_module():
             if not self.text.startswith('#!powershell\n'):
                 self.reporter.error(
                     path=self.object_path,
@@ -430,34 +403,20 @@ class ModuleValidator(Validator):
                 )
             return
 
-        missing_python_interpreter = False
+        if self._python_module():
+            missing_python_interpreter = False
 
-        if not self.text.startswith('#!/usr/bin/python'):
-            if NEW_STYLE_PYTHON_MODULE_RE.search(to_bytes(self.text)):
-                missing_python_interpreter = self.text.startswith('#!')  # shebang optional, but if present must match
-            else:
-                missing_python_interpreter = True  # shebang required
+            if not self.text.startswith('#!/usr/bin/python'):
+                if NEW_STYLE_PYTHON_MODULE_RE.search(to_bytes(self.text)):
+                    missing_python_interpreter = self.text.startswith('#!')  # shebang optional, but if present must match
+                else:
+                    missing_python_interpreter = True  # shebang required
 
-        if missing_python_interpreter:
-            self.reporter.error(
-                path=self.object_path,
-                code='missing-python-interpreter',
-                msg='Interpreter line is not "#!/usr/bin/python"',
-            )
-
-    def _check_type_instead_of_isinstance(self, powershell=False):
-        if powershell:
-            return
-        for line_no, line in enumerate(self.text.splitlines()):
-            typekeyword = TYPE_REGEX.match(line)
-            if typekeyword:
-                # TODO: add column
+            if missing_python_interpreter:
                 self.reporter.error(
                     path=self.object_path,
-                    code='unidiomatic-typecheck',
-                    msg=('Type comparison using type() found. '
-                         'Use isinstance() instead'),
-                    line=line_no + 1
+                    code='missing-python-interpreter',
+                    msg='Interpreter line is not "#!/usr/bin/python"',
                 )
 
     def _check_for_sys_exit(self):
@@ -494,34 +453,6 @@ class ModuleValidator(Validator):
                     msg='Found old style GPLv3 license header: '
                         'https://docs.ansible.com/ansible-core/devel/dev_guide/developing_modules_documenting.html#copyright'
                 )
-
-    def _check_for_subprocess(self):
-        for child in self.ast.body:
-            if isinstance(child, ast.Import):
-                if child.names[0].name == 'subprocess':
-                    for line_no, line in enumerate(self.text.splitlines()):
-                        sp_match = SUBPROCESS_REGEX.search(line)
-                        if sp_match:
-                            self.reporter.error(
-                                path=self.object_path,
-                                code='use-run-command-not-popen',
-                                msg=('subprocess.Popen call found. Should be module.run_command'),
-                                line=(line_no + 1),
-                                column=(sp_match.span()[0] + 1)
-                            )
-
-    def _check_for_os_call(self):
-        if 'os.call' in self.text:
-            for line_no, line in enumerate(self.text.splitlines()):
-                os_call_match = OS_CALL_REGEX.search(line)
-                if os_call_match:
-                    self.reporter.error(
-                        path=self.object_path,
-                        code='use-run-command-not-os-call',
-                        msg=('os.call() call found. Should be module.run_command'),
-                        line=(line_no + 1),
-                        column=(os_call_match.span()[0] + 1)
-                    )
 
     def _find_rejectlist_imports(self):
         for child in self.ast.body:
@@ -708,30 +639,57 @@ class ModuleValidator(Validator):
         # get module list for each
         # check "shape" of each module name
 
-        module_requires = r'(?im)^#\s*requires\s+\-module(?:s?)\s*(Ansible\.ModuleUtils\..+)'
-        csharp_requires = r'(?im)^#\s*ansiblerequires\s+\-csharputil\s*(Ansible\..+)'
+        legacy_ps_requires = r'(?im)^#\s*Requires\s+\-Module(?:s?)\s+(Ansible\.ModuleUtils\..+)'
+        ps_requires = r"""(?imx)
+            ^\#\s*AnsibleRequires\s+-PowerShell\s+
+            (
+                # Builtin PowerShell module
+                (Ansible\.ModuleUtils\.[\w\.]+)
+                |
+                # Fully qualified collection PowerShell module
+                (ansible_collections\.\w+\.\w+\.plugins\.module_utils\.[\w\.]+)
+                |
+                # Relative collection PowerShell module
+                (\.[\w\.]+)
+            )
+            (\s+-Optional)?"""
+        csharp_requires = r"""(?imx)
+            ^\#\s*AnsibleRequires\s+-CSharpUtil\s+
+            (
+                # Builtin C# util
+                (Ansible\.[\w\.]+)
+                |
+                # Fully qualified collection C# util
+                (ansible_collections\.\w+\.\w+\.plugins\.module_utils\.[\w\.]+)
+                |
+                # Relative collection C# util
+                (\.[\w\.]+)
+            )
+            (\s+-Optional)?"""
+
         found_requires = False
 
-        for req_stmt in re.finditer(module_requires, self.text):
-            found_requires = True
-            # this will bomb on dictionary format - "don't do that"
-            module_list = [x.strip() for x in req_stmt.group(1).split(',')]
-            if len(module_list) > 1:
-                self.reporter.error(
-                    path=self.object_path,
-                    code='multiple-utils-per-requires',
-                    msg='Ansible.ModuleUtils requirements do not support multiple modules per statement: "%s"' % req_stmt.group(0)
-                )
-                continue
+        for pattern, required_type in [(legacy_ps_requires, "Requires"), (ps_requires, "AnsibleRequires")]:
+            for req_stmt in re.finditer(pattern, self.text):
+                found_requires = True
+                # this will bomb on dictionary format - "don't do that"
+                module_list = [x.strip() for x in req_stmt.group(1).split(',')]
+                if len(module_list) > 1:
+                    self.reporter.error(
+                        path=self.object_path,
+                        code='multiple-utils-per-requires',
+                        msg='Ansible.ModuleUtils requirements do not support multiple modules per statement: "%s"' % req_stmt.group(0)
+                    )
+                    continue
 
-            module_name = module_list[0]
+                module_name = module_list[0]
 
-            if module_name.lower().endswith('.psm1'):
-                self.reporter.error(
-                    path=self.object_path,
-                    code='invalid-requires-extension',
-                    msg='Module #Requires should not end in .psm1: "%s"' % module_name
-                )
+                if module_name.lower().endswith('.psm1'):
+                    self.reporter.error(
+                        path=self.object_path,
+                        code='invalid-requires-extension',
+                        msg='Module #%s should not end in .psm1: "%s"' % (required_type, module_name)
+                    )
 
         for req_stmt in re.finditer(csharp_requires, self.text):
             found_requires = True
@@ -859,27 +817,101 @@ class ModuleValidator(Validator):
                 msg='%s: %s' % (combined_path, error_message)
             )
 
+    def _validate_option_docs(self, options: t.Any, *, context: list[str] | None = None, positional: t.Any | None = None) -> None:
+        if not isinstance(options, dict):
+            return
+        if context is None:
+            context = []
+
+        if isinstance(positional, str):
+            positional = [part.strip() for part in positional.split(",")] if positional else []
+        if isinstance(positional, list):
+            prev_positional = set()
+            for pos_opt in positional:
+                if pos_opt in prev_positional:
+                    self.reporter.error(
+                        path=self.object_path,
+                        code='positional-repeated',
+                        msg=f"The option {pos_opt!r} is listed as a positional option more than once",
+                    )
+                if pos_opt not in options:
+                    self.reporter.error(
+                        path=self.object_path,
+                        code='positional-not-option',
+                        msg=f"{pos_opt!r} is listed as a positional option, but is not an option of the plugin",
+                    )
+                prev_positional.add(pos_opt)
+
+        normalized_option_alias_names: dict[str, dict[str, set[str]]] = dict()
+
+        def add_option_alias_name(name: str, option_name: str) -> None:
+            normalized_name = str(name).lower()
+            normalized_option_alias_names.setdefault(normalized_name, {}).setdefault(option_name, set()).add(name)
+
+        for option, data in options.items():
+            if 'suboptions' in data:
+                self._validate_option_docs(data.get('suboptions'), context=context + [option])
+            add_option_alias_name(option, option)
+            if 'aliases' in data and isinstance(data['aliases'], list):
+                for alias in data['aliases']:
+                    add_option_alias_name(alias, option)
+
+        for normalized_name, options in normalized_option_alias_names.items():
+            if len(options) < 2:
+                continue
+
+            what = []
+            for option_name, names in sorted(options.items()):
+                if option_name in names:
+                    what.append("option '%s'" % option_name)
+                else:
+                    what.append("alias '%s' of option '%s'" % (sorted(names)[0], option_name))
+            msg = "Multiple options/aliases"
+            if context:
+                msg += " found in %s" % " -> ".join(context)
+            msg += " are equal up to casing: %s" % ", ".join(what)
+            self.reporter.error(
+                path=self.object_path,
+                code='option-equal-up-to-casing',
+                msg=msg,
+            )
+
+    def _validate_return_docs(self, returns: object, context: list[str] | None = None) -> None:
+        if not isinstance(returns, dict):
+            return
+        if context is None:
+            context = []
+
+        for rv, data in returns.items():
+            if isinstance(data, dict) and "contains" in data:
+                self._validate_return_docs(data["contains"], context + [rv])
+
+            if str(rv) in FORBIDDEN_DICTIONARY_KEYS or not str(rv).isidentifier():
+                msg = f"Return value key {rv!r}"
+                if context:
+                    msg += " found in %s" % " -> ".join(context)
+                msg += " should not be used for return values since it cannot be accessed with dot notation in Jinja"
+                self.reporter.error(
+                    path=self.object_path,
+                    code='bad-return-value-key',
+                    msg=msg,
+                )
+
     def _validate_docs(self):
         doc = None
-        # We have three ways of marking deprecated/removed files.  Have to check each one
+        # We have two ways of marking deprecated/removed files. Have to check each one
         # individually and then make sure they all agree
-        filename_deprecated_or_removed = False
-        deprecated = False
         doc_deprecated = None  # doc legally might not exist
         routing_says_deprecated = False
 
-        if self.object_name.startswith('_') and not os.path.islink(self.object_path):
-            filename_deprecated_or_removed = True
-
-        # We are testing a collection
         if self.routing:
             routing_deprecation = self.routing.get('plugin_routing', {})
             routing_deprecation = routing_deprecation.get('modules' if self.plugin_type == 'module' else self.plugin_type, {})
             routing_deprecation = routing_deprecation.get(self.name, {}).get('deprecation', {})
             if routing_deprecation:
-                # meta/runtime.yml says this is deprecated
+                # consult meta/runtime.yml for collection to see if this is deprecated
+                # consult ansible_builtin_runtime.yml for ansible.builtin to see if this is deprecated
                 routing_says_deprecated = True
-                deprecated = True
 
         if self._python_module():
             doc_info = self._get_py_docs()
@@ -957,21 +989,18 @@ class ModuleValidator(Validator):
             add_collection_to_versions_and_dates(doc, self.collection_name,
                                                  is_module=self.plugin_type == 'module')
 
-            missing_fragment = False
             with CaptureStd():
                 try:
-                    get_docstring(self.path, fragment_loader=fragment_loader,
-                                  verbose=True,
-                                  collection_name=self.collection_name,
-                                  plugin_type=self.plugin_type)
-                except AssertionError:
-                    fragment = doc['extends_documentation_fragment']
-                    self.reporter.error(
-                        path=self.object_path,
-                        code='missing-doc-fragment',
-                        msg='DOCUMENTATION fragment missing: %s' % fragment
+                    get_docstring(
+                        filename=os.path.abspath(self.path),
+                        fragment_loader=fragment_loader,
+                        verbose=True,
+                        collection_name=self.collection_name,
+                        plugin_type=self.plugin_type,
                     )
-                    missing_fragment = True
+                except AnsibleFragmentError:
+                    # Will be re-triggered below when explicitly calling add_fragments()
+                    pass
                 except Exception as e:
                     self.reporter.trace(
                         path=self.object_path,
@@ -983,9 +1012,16 @@ class ModuleValidator(Validator):
                         msg='Unknown DOCUMENTATION error, see TRACE: %s' % e
                     )
 
-            if not missing_fragment:
-                add_fragments(doc, self.object_path, fragment_loader=fragment_loader,
-                              is_module=self.plugin_type == 'module')
+            try:
+                add_fragments(doc, os.path.abspath(self.object_path), fragment_loader=fragment_loader,
+                              is_module=self.plugin_type == 'module', section='DOCUMENTATION')
+            except AnsibleFragmentError as exc:
+                error = str(exc).replace(os.path.abspath(self.object_path), self.object_path)
+                self.reporter.error(
+                    path=self.object_path,
+                    code='doc-fragment-error',
+                    msg=f'Error while adding fragments: {error}'
+                )
 
             if 'options' in doc and doc['options'] is None:
                 self.reporter.error(
@@ -1011,30 +1047,25 @@ class ModuleValidator(Validator):
             if os.path.islink(self.object_path):
                 # This module has an alias, which we can tell as it's a symlink
                 # Rather than checking for `module: $filename` we need to check against the true filename
-                self._validate_docs_schema(
-                    doc,
-                    doc_schema(
-                        os.readlink(self.object_path).split('.')[0],
-                        for_collection=bool(self.collection),
-                        deprecated_module=deprecated,
-                        plugin_type=self.plugin_type,
-                    ),
-                    'DOCUMENTATION',
-                    'invalid-documentation',
-                )
+                module_name = os.readlink(self.object_path).split('.')[0]
             else:
                 # This is the normal case
-                self._validate_docs_schema(
-                    doc,
-                    doc_schema(
-                        self.object_name.split('.')[0],
-                        for_collection=bool(self.collection),
-                        deprecated_module=deprecated,
-                        plugin_type=self.plugin_type,
-                    ),
-                    'DOCUMENTATION',
-                    'invalid-documentation',
-                )
+                module_name = self.object_name.split('.')[0]
+
+            self._validate_docs_schema(
+                doc,
+                doc_schema(
+                    module_name,
+                    for_collection=bool(self.collection),
+                    deprecated_module=routing_says_deprecated or doc_deprecated,
+                    plugin_type=self.plugin_type,
+                ),
+                'DOCUMENTATION',
+                'invalid-documentation',
+            )
+
+            if doc:
+                self._validate_option_docs(doc.get('options'), positional=doc.get('positional'))
 
             self._validate_all_semantic_markup(doc, returns)
 
@@ -1081,10 +1112,21 @@ class ModuleValidator(Validator):
                     self.collection_name,
                     is_module=self.plugin_type == 'module',
                     return_docs=True)
+                try:
+                    add_fragments(returns, os.path.abspath(self.object_path), fragment_loader=fragment_loader,
+                                  is_module=self.plugin_type == 'module', section='RETURN')
+                except AnsibleFragmentError as exc:
+                    error = str(exc).replace(os.path.abspath(self.object_path), self.object_path)
+                    self.reporter.error(
+                        path=self.object_path,
+                        code='return-fragment-error',
+                        msg=f'Error while adding fragments: {error}'
+                    )
             self._validate_docs_schema(
                 returns,
                 return_schema(for_collection=bool(self.collection), plugin_type=self.plugin_type),
                 'RETURN', 'return-syntax-error')
+            self._validate_return_docs(returns)
 
         elif self.plugin_type in PLUGINS_WITH_RETURN_VALUES:
             if self._is_new_module():
@@ -1102,32 +1144,15 @@ class ModuleValidator(Validator):
 
         # Check for mismatched deprecation
         if not self.collection:
-            mismatched_deprecation = True
-            if not (filename_deprecated_or_removed or deprecated or doc_deprecated):
-                mismatched_deprecation = False
-            else:
-                if (filename_deprecated_or_removed and doc_deprecated):
-                    mismatched_deprecation = False
-                if (filename_deprecated_or_removed and not doc):
-                    mismatched_deprecation = False
-
-            if mismatched_deprecation:
+            if doc_deprecated != routing_says_deprecated:
                 self.reporter.error(
                     path=self.object_path,
                     code='deprecation-mismatch',
-                    msg='Module deprecation/removed must agree in documentation, by prepending filename with'
-                        ' "_", and setting DOCUMENTATION.deprecated for deprecation or by removing all'
+                    msg='Module deprecation/removed must agree in documentation, by adding an entry in ansible_builtin_runtime.yml'
+                        ' and setting DOCUMENTATION.deprecated for deprecation or by removing all'
                         ' documentation for removed'
                 )
         else:
-            # We are testing a collection
-            if self.object_name.startswith('_'):
-                self.reporter.error(
-                    path=self.object_path,
-                    code='collections-no-underscore-on-deprecation',
-                    msg='Deprecated content in collections MUST NOT start with "_", update meta/runtime.yml instead',
-                )
-
             if not (doc_deprecated == routing_says_deprecated):
                 # DOCUMENTATION.deprecated and meta/runtime.yml disagree
                 self.reporter.error(
@@ -1193,7 +1218,7 @@ class ModuleValidator(Validator):
             for entry in object:
                 self._validate_semantic_markup(entry)
             return
-        if not isinstance(object, string_types):
+        if not isinstance(object, str):
             return
 
         if self.collection:
@@ -1227,16 +1252,18 @@ class ModuleValidator(Validator):
         if not isinstance(options, dict):
             return
         for key, value in options.items():
-            self._validate_semantic_markup(value.get('description'))
-            self._validate_semantic_markup_options(value.get('suboptions'))
+            if isinstance(value, dict):
+                self._validate_semantic_markup(value.get('description'))
+                self._validate_semantic_markup_options(value.get('suboptions'))
 
     def _validate_semantic_markup_return_values(self, return_vars):
         if not isinstance(return_vars, dict):
             return
         for key, value in return_vars.items():
-            self._validate_semantic_markup(value.get('description'))
-            self._validate_semantic_markup(value.get('returned'))
-            self._validate_semantic_markup_return_values(value.get('contains'))
+            if isinstance(value, dict):
+                self._validate_semantic_markup(value.get('description'))
+                self._validate_semantic_markup(value.get('returned'))
+                self._validate_semantic_markup_return_values(value.get('contains'))
 
     def _validate_all_semantic_markup(self, docs, return_docs):
         if not isinstance(docs, dict):
@@ -1264,14 +1291,19 @@ class ModuleValidator(Validator):
                         self._validate_semantic_markup(entry.get(key))
 
         if isinstance(docs.get('deprecated'), dict):
-            for key in ('why', 'alternative'):
+            for key in ('why', 'alternative', 'alternatives'):
                 self._validate_semantic_markup(docs.get('deprecated').get(key))
 
         self._validate_semantic_markup_options(docs.get('options'))
         self._validate_semantic_markup_return_values(return_docs)
 
     def _check_version_added(self, doc, existing_doc):
+        deprecated = doc.get('deprecated', False)
+        if deprecated:
+            return
+
         version_added_raw = doc.get('version_added')
+
         try:
             collection_name = doc.get('version_added_collection')
             version_added = self._create_strict_version(
@@ -1312,7 +1344,12 @@ class ModuleValidator(Validator):
 
     def _validate_ansible_module_call(self, docs):
         try:
-            spec, kwargs = get_argument_spec(self.path, self.collection)
+            if self._python_module():
+                spec, kwargs = get_py_argument_spec(self.path, self.collection)
+            elif self._powershell_module():
+                spec, kwargs = get_ps_argument_spec(self.path, self.collection)
+            else:
+                raise NotImplementedError()
         except AnsibleModuleNotInitialized:
             self.reporter.error(
                 path=self.object_path,
@@ -1374,7 +1411,7 @@ class ModuleValidator(Validator):
                 continue
             bad_term = False
             for term in check:
-                if not isinstance(term, string_types):
+                if not isinstance(term, str):
                     msg = name
                     if context:
                         msg += " found in %s" % " -> ".join(context)
@@ -1442,7 +1479,7 @@ class ModuleValidator(Validator):
                 continue
             bad_term = False
             for term in requirements:
-                if not isinstance(term, string_types):
+                if not isinstance(term, str):
                     msg = "required_if"
                     if context:
                         msg += " found in %s" % " -> ".join(context)
@@ -1525,13 +1562,13 @@ class ModuleValidator(Validator):
             # This is already reported by schema checking
             return
         for key, value in terms.items():
-            if isinstance(value, string_types):
+            if isinstance(value, str):
                 value = [value]
             if not isinstance(value, (list, tuple)):
                 # This is already reported by schema checking
                 continue
             for term in value:
-                if not isinstance(term, string_types):
+                if not isinstance(term, str):
                     # This is already reported by schema checking
                     continue
             if len(set(value)) != len(value) or key in value:
@@ -1570,8 +1607,8 @@ class ModuleValidator(Validator):
 
         try:
             if not context:
-                add_fragments(docs, self.object_path, fragment_loader=fragment_loader,
-                              is_module=self.plugin_type == 'module')
+                add_fragments(docs, os.path.abspath(self.object_path), fragment_loader=fragment_loader,
+                              is_module=self.plugin_type == 'module', section='DOCUMENTATION')
         except Exception:
             # Cannot merge fragments
             return
@@ -1900,8 +1937,10 @@ class ModuleValidator(Validator):
             if len(doc_options_args) == 0:
                 # Undocumented arguments will be handled later (search for undocumented-parameter)
                 doc_options_arg = {}
+                doc_option_name = None
             else:
-                doc_options_arg = doc_options[doc_options_args[0]]
+                doc_option_name = doc_options_args[0]
+                doc_options_arg = doc_options[doc_option_name]
                 if len(doc_options_args) > 1:
                     msg = "Argument '%s' in argument_spec" % arg
                     if context:
@@ -1915,6 +1954,26 @@ class ModuleValidator(Validator):
                         code='parameter-documented-multiple-times',
                         msg=msg
                     )
+
+            all_aliases = set(aliases + [arg])
+            all_docs_aliases = set(
+                ([doc_option_name] if doc_option_name is not None else [])
+                +
+                (doc_options_arg['aliases'] if isinstance(doc_options_arg.get('aliases'), list) else [])
+            )
+            if all_docs_aliases and all_aliases != all_docs_aliases:
+                msg = "Argument '%s' in argument_spec" % arg
+                if context:
+                    msg += " found in %s" % " -> ".join(context)
+                msg += " has names %s, but its documentation has names %s" % (
+                    ", ".join([("'%s'" % alias) for alias in sorted(all_aliases)]),
+                    ", ".join([("'%s'" % alias) for alias in sorted(all_docs_aliases)])
+                )
+                self.reporter.error(
+                    path=self.object_path,
+                    code='parameter-documented-aliases-differ',
+                    msg=msg
+                )
 
             try:
                 doc_default = None
@@ -2145,8 +2204,11 @@ class ModuleValidator(Validator):
         with CaptureStd():
             try:
                 existing_doc, dummy_examples, dummy_return, existing_metadata = get_docstring(
-                    self.base_module, fragment_loader, verbose=True, collection_name=self.collection_name,
-                    is_module=self.plugin_type == 'module')
+                    filename=os.path.abspath(self.base_module),
+                    fragment_loader=fragment_loader,
+                    verbose=True,
+                    collection_name=self.collection_name,
+                    plugin_type=self.plugin_type)
                 existing_options = existing_doc.get('options', {}) or {}
             except AssertionError:
                 fragment = doc['extends_documentation_fragment']
@@ -2268,7 +2330,6 @@ class ModuleValidator(Validator):
                      'extension for python modules or a .ps1 '
                      'for powershell modules')
             )
-            self._python_module_override = True
 
         if self._python_module() and self.ast is None:
             self.reporter.error(
@@ -2362,10 +2423,6 @@ class ModuleValidator(Validator):
                 first_callable = self._get_first_callable() or 1000000  # use a bogus "high" line number if no callable exists
                 self._ensure_imports_below_docs(doc_info, first_callable)
 
-            if self.plugin_type == 'module':
-                self._check_for_subprocess()
-                self._check_for_os_call()
-
         if self._powershell_module():
             self._validate_ps_replacers()
             docs_path = self._find_ps_docs_file()
@@ -2380,10 +2437,7 @@ class ModuleValidator(Validator):
         self._check_gpl3_header()
         if not self._just_docs() and not self._sidecar_doc() and not end_of_deprecation_should_be_removed_only:
             if self.plugin_type == 'module':
-                self._check_interpreter(powershell=self._powershell_module())
-            self._check_type_instead_of_isinstance(
-                powershell=self._powershell_module()
-            )
+                self._check_interpreter()
 
 
 class PythonPackageValidator(Validator):
@@ -2551,15 +2605,17 @@ def run():
     routing = None
     if args.collection:
         routing_file = 'meta/runtime.yml'
-        # Load meta/runtime.yml if it exists, as it may contain deprecation information
-        if os.path.isfile(routing_file):
-            try:
-                with open(routing_file) as f:
-                    routing = yaml.safe_load(f)
-            except yaml.error.MarkedYAMLError as ex:
-                print('%s:%d:%d: YAML load failed: %s' % (routing_file, ex.context_mark.line + 1, ex.context_mark.column + 1, re.sub(r'\s+', ' ', str(ex))))
-            except Exception as ex:  # pylint: disable=broad-except
-                print('%s:%d:%d: YAML load failed: %s' % (routing_file, 0, 0, re.sub(r'\s+', ' ', str(ex))))
+    else:
+        routing_file = 'lib/ansible/config/ansible_builtin_runtime.yml'
+
+    if os.path.isfile(routing_file):
+        try:
+            with open(routing_file) as f:
+                routing = yaml.safe_load(f)
+        except yaml.error.MarkedYAMLError as ex:
+            print('%s:%d:%d: YAML load failed: %s' % (routing_file, ex.context_mark.line + 1, ex.context_mark.column + 1, re.sub(r'\s+', ' ', str(ex))))
+        except Exception as ex:  # pylint: disable=broad-except
+            print('%s:%d:%d: YAML load failed: %s' % (routing_file, 0, 0, re.sub(r'\s+', ' ', str(ex))))
 
     for plugin in args.plugins:
         if os.path.isfile(plugin):

@@ -14,11 +14,9 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-DOCUMENTATION = '''
+DOCUMENTATION = """
     name: free
     short_description: Executes tasks without waiting for all hosts
     description:
@@ -29,19 +27,21 @@ DOCUMENTATION = '''
           won't hold up the rest of the hosts and tasks.
     version_added: "2.0"
     author: Ansible Core Team
-'''
+"""
 
 import time
 
 from ansible import constants as C
+from ansible._internal import _task
 from ansible.errors import AnsibleError, AnsibleParserError
 from ansible.playbook.handler import Handler
 from ansible.playbook.included_file import IncludedFile
 from ansible.plugins.loader import action_loader
 from ansible.plugins.strategy import StrategyBase
-from ansible.template import Templar
-from ansible.module_utils.common.text.converters import to_text
+from ansible._internal._templating._engine import TemplateEngine
 from ansible.utils.display import Display
+from ansible.executor.play_iterator import PlayIterator
+from ansible.playbook.play_context import PlayContext
 
 display = Display()
 
@@ -55,8 +55,8 @@ class StrategyModule(StrategyBase):
         super(StrategyModule, self).__init__(tqm)
         self._host_pinned = False
 
-    def run(self, iterator, play_context):
-        '''
+    def run(self, iterator: PlayIterator, play_context: PlayContext):  # type: ignore[override]
+        """
         The "free" strategy is a bit more complex, in that it allows tasks to
         be sent to hosts as quickly as they can be processed. This means that
         some hosts may finish very quickly if run tasks result in little or no
@@ -67,12 +67,12 @@ class StrategyModule(StrategyBase):
         and starting the search from there as opposed to the top of the hosts
         list again, which would end up favoring hosts near the beginning of the
         list.
-        '''
+        """
 
         # the last host to be given a task
         last_host = 0
 
-        result = self._tqm.RUN_OK
+        result = int(self._tqm.RUN_OK)
 
         # start with all workers being counted as being free
         workers_free = len(self._workers)
@@ -92,11 +92,17 @@ class StrategyModule(StrategyBase):
                 result = False
                 break
 
+            # Reset last_host if it's out of bounds for the current hosts_left
+            # This can happen when hosts become unreachable between iterations
+            if last_host >= len(hosts_left):
+                last_host = 0
+
             work_to_do = False        # assume we have no more work to do
             starting_host = last_host  # save current position so we know when we've looped back around and need to break
 
             # try and find an unblocked host with a task to run
             host_results = []
+            meta_task_dummy_results_count = 0
             while True:
                 host = hosts_left[last_host]
                 display.debug("next free host: %s" % host)
@@ -125,13 +131,13 @@ class StrategyModule(StrategyBase):
                                                                     _hosts=self._hosts_cache,
                                                                     _hosts_all=self._hosts_cache_all)
                         self.add_tqm_variables(task_vars, play=iterator._play)
-                        templar = Templar(loader=self._loader, variables=task_vars)
+                        templar = TemplateEngine(loader=self._loader, variables=task_vars)
                         display.debug("done getting variables", host=host_name)
 
                         try:
                             throttle = int(templar.template(task.throttle))
-                        except Exception as e:
-                            raise AnsibleError("Failed to convert the throttle value to an integer.", obj=task._ds, orig_exc=e)
+                        except Exception as ex:
+                            raise AnsibleError("Failed to convert the throttle value to an integer.", obj=task.throttle) from ex
 
                         if throttle > 0:
                             same_tasks = 0
@@ -146,6 +152,8 @@ class StrategyModule(StrategyBase):
                         # advance the host, mark the host blocked, and queue it
                         self._blocked_hosts[host_name] = True
                         iterator.set_state_for_host(host.name, state)
+                        if isinstance(task, Handler):
+                            task.remove_host(host)
 
                         try:
                             action = action_loader.get(task.action, class_only=True, collection_list=task.collections)
@@ -154,13 +162,7 @@ class StrategyModule(StrategyBase):
                             # corresponding action plugin
                             action = None
 
-                        try:
-                            task.name = to_text(templar.template(task.name, fail_on_undefined=False), nonstring='empty')
-                            display.debug("done templating", host=host_name)
-                        except Exception:
-                            # just ignore any errors during task name templating,
-                            # we don't care if it just shows the raw name
-                            display.debug("templating failed for some reason", host=host_name)
+                        task.post_validate_attribute("name", templar=templar)
 
                         run_once = templar.template(task.run_once) or action and getattr(action, 'BYPASS_HOST_LOOP', False)
                         if run_once:
@@ -171,16 +173,10 @@ class StrategyModule(StrategyBase):
                                 display.warning("Using run_once with the free strategy is not currently supported. This task will still be "
                                                 "executed for every host in the inventory list.")
 
-                        # check to see if this task should be skipped, due to it being a member of a
-                        # role which has already run (and whether that role allows duplicate execution)
-                        if not isinstance(task, Handler) and task._role:
-                            role_obj = self._get_cached_role(task, iterator._play)
-                            if role_obj.has_run(host) and role_obj._metadata.allow_duplicates is False:
-                                display.debug("'%s' skipped because role has already run" % task, host=host_name)
-                                del self._blocked_hosts[host_name]
-                                continue
-
                         if task.action in C._ACTION_META:
+                            if self._host_pinned:
+                                meta_task_dummy_results_count += 1
+                                workers_free -= 1
                             self._execute_meta(task, play_context, iterator, target_host=host)
                             self._blocked_hosts[host_name] = False
                         else:
@@ -220,7 +216,7 @@ class StrategyModule(StrategyBase):
             host_results.extend(results)
 
             # each result is counted as a worker being free again
-            workers_free += len(results)
+            workers_free += len(results) + meta_task_dummy_results_count
 
             self.update_active_connections(results)
 
@@ -248,21 +244,36 @@ class StrategyModule(StrategyBase):
                             )
                         else:
                             is_handler = isinstance(included_file._task, Handler)
-                            new_blocks = self._load_included_file(included_file, iterator=iterator, is_handler=is_handler)
+                            new_blocks = self._load_included_file(
+                                included_file,
+                                iterator=iterator,
+                                is_handler=is_handler,
+                            )
 
                         # let PlayIterator know about any new handlers included via include_role or
                         # import_role within include_role/include_taks
                         iterator.handlers = [h for b in iterator._play.handlers for h in b.block]
                     except AnsibleParserError:
                         raise
-                    except AnsibleError as e:
-                        if included_file._is_role:
-                            # include_role does not have on_include callback so display the error
-                            display.error(to_text(e), wrap_text=False)
+                    except AnsibleError as ex:
                         for r in included_file._results:
-                            r._result['failed'] = True
-                            failed_includes_hosts.add(r._host)
+                            # RPFIX-9: FUTURE: do this better, instead of creating a throw-away UTR to merge onto the existing one
+                            utr = _task.UnifiedTaskResult._create_from_exception(ex, source_is_module=False)
+
+                            r.utr.failed = utr.failed
+                            r.utr.exception = utr.exception
+                            r.utr.msg = utr.msg
+
+                            self._tqm._stats.increment('failures', r.host.name)
+                            self._tqm.send_callback('v2_runner_on_failed', r)
+                            failed_includes_hosts.add(r.host)
                         continue
+                    else:
+                        # since we skip incrementing the stats when the task result is
+                        # first processed, we do so now for each host in the list
+                        for host in included_file._hosts:
+                            self._tqm._stats.increment('ok', host.name)
+                        self._tqm.send_callback('v2_playbook_on_include', included_file)
 
                     for new_block in new_blocks:
                         if is_handler:

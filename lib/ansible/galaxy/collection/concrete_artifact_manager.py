@@ -3,17 +3,20 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 """Concrete collection candidate management helper module."""
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import json
 import os
 import tarfile
 import subprocess
 import typing as t
+import yaml
 
-from contextlib import contextmanager
+from collections.abc import Mapping
+from contextlib import contextmanager, suppress
+from functools import cache
 from hashlib import sha256
+from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urldefrag
 from shutil import rmtree
@@ -25,21 +28,22 @@ if t.TYPE_CHECKING:
     )
     from ansible.galaxy.token import GalaxyToken
 
+from ansible import context
 from ansible.errors import AnsibleError
 from ansible.galaxy import get_collections_galaxy_meta_info
-from ansible.galaxy.api import should_retry_error
+from ansible.galaxy.api import should_retry_error, CollectionVersionMetadata, GalaxyAPI
 from ansible.galaxy.dependency_resolution.dataclasses import _GALAXY_YAML
 from ansible.galaxy.user_agent import user_agent
 from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
 from ansible.module_utils.api import retry_with_delays_and_condition
 from ansible.module_utils.api import generate_jittered_backoff
 from ansible.module_utils.common.process import get_bin_path
+from ansible.module_utils.common.sentinel import Sentinel
 from ansible.module_utils.common.yaml import yaml_load
 from ansible.module_utils.urls import open_url
 from ansible.utils.display import Display
-from ansible.utils.sentinel import Sentinel
 
-import yaml
+import ansible.constants as C
 
 
 display = Display()
@@ -62,13 +66,12 @@ class ConcreteArtifactsManager:
     """
     def __init__(self, b_working_directory, validate_certs=True, keyring=None, timeout=60, required_signature_count=None, ignore_signature_errors=None):
         # type: (bytes, bool, str, int, str, list[str]) -> None
-        """Initialize ConcreteArtifactsManager caches and costraints."""
+        """Initialize ConcreteArtifactsManager caches and constraints."""
         self._validate_certs = validate_certs  # type: bool
         self._artifact_cache = {}  # type: dict[bytes, bytes]
         self._galaxy_artifact_cache = {}  # type: dict[Candidate | Requirement, bytes]
         self._artifact_meta_cache = {}  # type: dict[bytes, dict[str, str | list[str] | dict[str, str] | None | t.Type[Sentinel]]]
-        self._galaxy_collection_cache = {}  # type: dict[Candidate | Requirement, tuple[str, str, GalaxyToken]]
-        self._galaxy_collection_origin_cache = {}  # type: dict[Candidate, tuple[str, list[dict[str, str]]]]
+        self._galaxy_collection_cache: dict[Candidate, tuple[CollectionVersionMetadata, GalaxyAPI]] = {}
         self._b_working_directory = b_working_directory  # type: bytes
         self._supplemental_signature_cache = {}  # type: dict[str, str]
         self._keyring = keyring  # type: str
@@ -103,15 +106,12 @@ class ConcreteArtifactsManager:
 
     def get_galaxy_artifact_source_info(self, collection):
         # type: (Candidate) -> dict[str, t.Union[str, list[dict[str, str]]]]
-        server = collection.src.api_server
 
         try:
-            download_url = self._galaxy_collection_cache[collection][0]
-            signatures_url, signatures = self._galaxy_collection_origin_cache[collection]
+            metadata, server = self._galaxy_collection_cache[collection]
         except KeyError as key_err:
             raise RuntimeError(
-                'The is no known source for {coll!s}'.
-                format(coll=collection),
+                f"There is no known source for {collection!s}"
             ) from key_err
 
         return {
@@ -119,14 +119,13 @@ class ConcreteArtifactsManager:
             "namespace": collection.namespace,
             "name": collection.name,
             "version": collection.ver,
-            "server": server,
-            "version_url": signatures_url,
-            "download_url": download_url,
-            "signatures": signatures,
+            "server": server.api_server,
+            "version_url": metadata.signatures_url,
+            "download_url": metadata.download_url,
+            "signatures": metadata.signatures,
         }
 
-    def get_galaxy_artifact_path(self, collection):
-        # type: (t.Union[Candidate, Requirement]) -> bytes
+    def get_galaxy_artifact_path(self, collection: Candidate) -> bytes:
         """Given a Galaxy-stored collection, return a cached path.
 
         If it's not yet on disk, this method downloads the artifact first.
@@ -137,11 +136,10 @@ class ConcreteArtifactsManager:
             pass
 
         try:
-            url, sha256_hash, token = self._galaxy_collection_cache[collection]
+            metadata, api = self._galaxy_collection_cache[collection]
         except KeyError as key_err:
             raise RuntimeError(
-                'The is no known source for {coll!s}'.
-                format(coll=collection),
+                f'There is no known source for {collection!s}'
             ) from key_err
 
         display.vvvv(
@@ -151,39 +149,27 @@ class ConcreteArtifactsManager:
 
         try:
             b_artifact_path = _download_file(
-                url,
+                metadata.download_url,
                 self._b_working_directory,
-                expected_hash=sha256_hash,
-                validate_certs=self._validate_certs,
-                token=token,
+                expected_hash=metadata.artifact_sha256,
+                validate_certs=api.validate_certs,
+                token=api.token,
             )  # type: bytes
         except URLError as err:
             raise AnsibleError(
                 'Failed to download collection tar '
-                "from '{coll_src!s}': {download_err!s}".
-                format(
-                    coll_src=to_native(collection.src),
-                    download_err=to_native(err),
-                ),
+                f"from '{api!s}': {err!s}"
             ) from err
         except Exception as err:
             raise AnsibleError(
                 'Failed to download collection tar '
-                "from '{coll_src!s}' due to the following unforeseen error: "
-                '{download_err!s}'.
-                format(
-                    coll_src=to_native(collection.src),
-                    download_err=to_native(err),
-                ),
+                f"from '{api!s}' due to the following unforeseen error: "
+                f'{err!s}'
             ) from err
         else:
             display.vvv(
-                "Collection '{coll!s}' obtained from "
-                'server {server!s} {url!s}'.format(
-                    coll=collection, server=collection.src or 'Galaxy',
-                    url=collection.src.api_server if collection.src is not None
-                    else '',
-                )
+                f"Collection '{collection!s}' obtained from server {api!s} "
+                f"{api.api_server!s}"
             )
 
         self._galaxy_artifact_cache[collection] = b_artifact_path
@@ -337,15 +323,40 @@ class ConcreteArtifactsManager:
         self._artifact_meta_cache[collection.src] = collection_meta
         return collection_meta
 
-    def save_collection_source(self, collection, url, sha256_hash, token, signatures_url, signatures):
-        # type: (Candidate, str, str, GalaxyToken, str, list[dict[str, str]]) -> None
-        """Store collection URL, SHA256 hash and Galaxy API token.
+    def get_direct_requires_ansible(self, collection: Candidate) -> str | None:
+        """Extract requires_ansible from the on-disk collection artifact."""
+        if collection.is_concrete_artifact:
+            b_artifact_path = self.get_artifact_path(collection)
+        else:
+            b_artifact_path = self.get_galaxy_artifact_path(collection)
+
+        if collection.is_url or collection.is_file or collection.is_online_index_pointer:
+            runtime = _get_runtime_from_tar(b_artifact_path) or {}
+        elif collection.is_dir:
+            runtime = _get_runtime_from_dir(b_artifact_path) or {}
+        elif collection.is_virtual:
+            runtime = {}
+
+        if not isinstance(runtime, Mapping):
+            raise AnsibleError(
+                f"The collection {collection} (type {collection.type}) (from {collection.src}) "
+                "has an invalid meta/runtime.yml metadata. This file must contain a YAML dictionary."
+            )
+        if "requires_ansible" in runtime and not isinstance(runtime["requires_ansible"], str):
+            raise AnsibleError(
+                f"The collection {collection} (type {collection.type}) from {collection.src}) "
+                "has invalid meta/runtime.yml metadata. The value for requires_ansible must be a string."
+            )
+        # NOTE: Using None as a sentinel since it's not a valid value otherwise.
+        return runtime.get("requires_ansible")
+
+    def save_collection_source(self, collection: Candidate, metadata: CollectionVersionMetadata, api: GalaxyAPI) -> None:
+        """Store collection version metadata and origin.
 
         This is a hook that is supposed to be called before attempting to
         download Galaxy-based collections with ``get_galaxy_artifact_path()``.
         """
-        self._galaxy_collection_cache[collection] = url, sha256_hash, token
-        self._galaxy_collection_origin_cache[collection] = signatures_url, signatures
+        self._galaxy_collection_cache[collection] = (metadata, api)
 
     @classmethod
     @contextmanager
@@ -414,7 +425,7 @@ def _extract_collection_from_git(repo_url, coll_ver, b_path):
     b_checkout_path = mkdtemp(
         dir=b_path,
         prefix=to_bytes(name, errors='surrogate_or_strict'),
-    )  # type: bytes
+    )
 
     try:
         git_executable = get_bin_path('git')
@@ -426,10 +437,13 @@ def _extract_collection_from_git(repo_url, coll_ver, b_path):
 
     # Perform a shallow clone if simply cloning HEAD
     if version == 'HEAD':
-        git_clone_cmd = git_executable, 'clone', '--depth=1', git_url, to_text(b_checkout_path)
+        git_clone_cmd = [git_executable, 'clone', '--depth=1', git_url, to_text(b_checkout_path)]
     else:
-        git_clone_cmd = git_executable, 'clone', git_url, to_text(b_checkout_path)
+        git_clone_cmd = [git_executable, 'clone', git_url, to_text(b_checkout_path)]
     # FIXME: '--branch', version
+
+    if context.CLIARGS['ignore_certs'] or C.GALAXY_IGNORE_CERTS:
+        git_clone_cmd.extend(['-c', 'http.sslVerify=false'])
 
     try:
         subprocess.check_call(git_clone_cmd)
@@ -439,15 +453,20 @@ def _extract_collection_from_git(repo_url, coll_ver, b_path):
             format(repo_url=to_native(git_url)),
         ) from proc_err
 
-    git_switch_cmd = git_executable, 'checkout', to_text(version)
+    if version == 'HEAD':
+        git_args = ()
+    else:
+        git_args = '-c', 'advice.detachedHead=false'
+
+    git_switch_cmd = git_executable, *git_args, 'checkout', to_text(version)
     try:
         subprocess.check_call(git_switch_cmd, cwd=b_checkout_path)
     except subprocess.CalledProcessError as proc_err:
         raise AnsibleError(  # should probably be LookupError
             'Failed to switch a cloned Git repo `{repo_url!s}` '
-            'to the requested revision `{commitish!s}`.'.
+            'to the requested revision `{revision!s}`.'.
             format(
-                commitish=to_native(version),
+                revision=to_native(version),
                 repo_url=to_native(git_url),
             ),
         ) from proc_err
@@ -481,16 +500,13 @@ def _download_file(url, b_path, expected_hash, validate_certs, token=None, timeo
     display.display("Downloading %s to %s" % (url, to_text(b_tarball_dir)))
     # NOTE: Galaxy redirects downloads to S3 which rejects the request
     # NOTE: if an Authorization header is attached so don't redirect it
-    try:
-        resp = open_url(
-            to_native(url, errors='surrogate_or_strict'),
-            validate_certs=validate_certs,
-            headers=None if token is None else token.headers(),
-            unredirected_headers=['Authorization'], http_agent=user_agent(),
-            timeout=timeout
-        )
-    except Exception as err:
-        raise AnsibleError(to_native(err), orig_exc=err)
+    resp = open_url(
+        to_native(url, errors='surrogate_or_strict'),
+        validate_certs=validate_certs,
+        headers=None if token is None else token.headers(),
+        unredirected_headers=['Authorization'], http_agent=user_agent(),
+        timeout=timeout
+    )
 
     with open(b_file_path, 'wb') as download_file:  # type: t.BinaryIO
         actual_hash = _consume_file(resp, write_to=download_file)
@@ -655,14 +671,8 @@ def _get_json_from_installed_dir(
     try:
         with open(b_json_filepath, 'rb') as manifest_fd:
             b_json_text = manifest_fd.read()
-    except (IOError, OSError):
-        raise LookupError(
-            "The collection {manifest!s} path '{path!s}' does not exist.".
-            format(
-                manifest=filename,
-                path=to_native(b_json_filepath),
-            )
-        )
+    except OSError as ex:
+        raise LookupError(f"The collection {filename!r} path {to_text(b_json_filepath)!r} does not exist.") from ex
 
     manifest_txt = to_text(b_json_text, errors='surrogate_or_strict')
 
@@ -702,6 +712,11 @@ def _get_meta_from_installed_dir(
 def _get_meta_from_tar(
         b_path,  # type: bytes
 ):  # type: (...) -> dict[str, t.Union[str, list[str], dict[str, str], None, t.Type[Sentinel]]]
+    if not os.path.exists(b_path):
+        raise AnsibleError(
+            f"Unable to find collection artifact file at '{to_native(b_path)}'."
+        )
+
     if not tarfile.is_tarfile(b_path):
         raise AnsibleError(
             "Collection artifact at '{path!s}' is not a valid tar file.".
@@ -756,3 +771,21 @@ def _tarfile_extract(
     finally:
         if tar_obj is not None:
             tar_obj.close()
+
+
+@cache
+def _get_runtime_from_dir(b_path: bytes) -> object:
+    """Load the meta/runtime.yml from a collection directory."""
+    runtime_path = Path(b_path.decode()) / "meta" / "runtime.yml"
+    with suppress(OSError):
+        return yaml_load(runtime_path.read_text())
+
+
+@cache
+def _get_runtime_from_tar(b_path: bytes) -> object:
+    """Load the meta/runtime.yml from a collection artifact."""
+    with suppress(tarfile.TarError, KeyError):
+        with tarfile.open(b_path, mode='r') as collection_tar:
+            runtime = collection_tar.getmember("meta/runtime.yml")
+            with _tarfile_extract(collection_tar, runtime) as (_member, member_obj):
+                return yaml_load(member_obj)

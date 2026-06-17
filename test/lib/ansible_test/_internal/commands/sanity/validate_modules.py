@@ -1,4 +1,5 @@
 """Sanity test using validate-modules."""
+
 from __future__ import annotations
 
 import collections
@@ -41,6 +42,7 @@ from ...util_common import (
     process_scoped_temporary_directory,
     run_command,
     ResultType,
+    get_powershell_injector_env,
 )
 
 from ...ansible_util import (
@@ -121,6 +123,7 @@ class ValidateModulesTest(SanitySingleVersion):
 
     def test(self, args: SanityConfig, targets: SanityTargets, python: PythonConfig) -> TestResult:
         env = ansible_environment(args, color=False)
+        env.update(get_powershell_injector_env(args.controller_powershell, env))
 
         settings = self.load_processor(args)
 
@@ -159,7 +162,7 @@ class ValidateModulesTest(SanitySingleVersion):
                 temp_dir = process_scoped_temporary_directory(args)
 
                 with tarfile.open(path) as file:
-                    file.extractall(temp_dir)
+                    file.extractall(temp_dir, filter='data')
 
                 cmd.extend([
                     '--original-plugins', temp_dir,

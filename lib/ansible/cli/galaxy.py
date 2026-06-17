@@ -4,13 +4,13 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 # PYTHON_ARGCOMPLETE_OK
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 # ansible.cli needs to be imported first, to ensure the source bin/* scripts run that code first
 from ansible.cli import CLI
 
 import argparse
+import functools
 import json
 import os.path
 import pathlib
@@ -53,38 +53,17 @@ from ansible.module_utils.ansible_release import __version__ as ansible_version
 from ansible.module_utils.common.collections import is_iterable
 from ansible.module_utils.common.yaml import yaml_dump, yaml_load
 from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
-from ansible.module_utils import six
+from ansible._internal._datatag._tags import TrustedAsTemplate
 from ansible.parsing.dataloader import DataLoader
-from ansible.parsing.yaml.loader import AnsibleLoader
 from ansible.playbook.role.requirement import RoleRequirement
-from ansible.template import Templar
+from ansible._internal._templating._engine import TemplateEngine
+from ansible.template import trust_as_template
 from ansible.utils.collection_loader import AnsibleCollectionConfig
 from ansible.utils.display import Display
 from ansible.utils.plugin_docs import get_versioned_doclink
+from ansible.utils.vars import load_extra_vars
 
 display = Display()
-urlparse = six.moves.urllib.parse.urlparse
-
-# config definition by position: name, required, type
-SERVER_DEF = [
-    ('url', True, 'str'),
-    ('username', False, 'str'),
-    ('password', False, 'str'),
-    ('token', False, 'str'),
-    ('auth_url', False, 'str'),
-    ('api_version', False, 'int'),
-    ('validate_certs', False, 'bool'),
-    ('client_id', False, 'str'),
-    ('timeout', False, 'int'),
-]
-
-# config definition fields
-SERVER_ADDITIONAL = {
-    'api_version': {'default': None, 'choices': [2, 3]},
-    'validate_certs': {'cli': [{'name': 'validate_certs'}]},
-    'timeout': {'default': C.GALAXY_SERVER_TIMEOUT, 'cli': [{'name': 'timeout'}]},
-    'token': {'default': None},
-}
 
 
 def with_collection_artifacts_manager(wrapped_method):
@@ -94,12 +73,15 @@ def with_collection_artifacts_manager(wrapped_method):
     the related temporary directory auto-cleanup around the target
     method invocation.
     """
+    @functools.wraps(wrapped_method)
     def method_wrapper(*args, **kwargs):
         if 'artifacts_manager' in kwargs:
             return wrapped_method(*args, **kwargs)
 
-        # FIXME: use validate_certs context from Galaxy servers when downloading collections
-        # .get used here for when this is used in a non-CLI context
+        # configures validate_certs for type 'url' only
+        # type 'galaxy' inherits and overrides resolved_validate_certs
+        # type 'git' recalculates resolved_validate_certs
+        # NOTE: .get used here for when this is used in a non-CLI context
         artifacts_manager_kwargs = {'validate_certs': context.CLIARGS.get('resolved_validate_certs', True)}
 
         keyring = context.CLIARGS.get('keyring', None)
@@ -197,11 +179,11 @@ class RoleDistributionServer:
 
 
 class GalaxyCLI(CLI):
-    '''Command to manage Ansible roles and collections.
+    """Command to manage Ansible roles and collections.
 
        None of the CLI tools are designed to run concurrently with themselves.
        Use an external scheduler and/or locking to ensure there are no clashing operations.
-    '''
+    """
 
     name = 'ansible-galaxy'
 
@@ -231,8 +213,20 @@ class GalaxyCLI(CLI):
         self.lazy_role_api = None
         super(GalaxyCLI, self).__init__(args)
 
+    @property
+    def collection_paths(self):
+        """
+        Exclude lib/ansible/_internal/ansible_collections/.
+        """
+        # exclude bundled collections, e.g. ansible._protomatter
+        return [
+            path
+            for path in AnsibleCollectionConfig.collection_paths
+            if path != AnsibleCollectionConfig._internal_collections
+        ]
+
     def init_parser(self):
-        ''' create an options parser for bin/ansible '''
+        """ create an options parser for bin/ansible """
 
         super(GalaxyCLI, self).init_parser(
             desc="Perform various Role and Collection related operations.",
@@ -293,6 +287,7 @@ class GalaxyCLI(CLI):
 
         # Add sub parser for the Galaxy collection actions
         collection = type_parser.add_parser('collection', help='Manage an Ansible Galaxy collection.')
+        collection.set_defaults(func=self.execute_collection)  # to satisfy doc build
         collection_parser = collection.add_subparsers(metavar='COLLECTION_ACTION', dest='action')
         collection_parser.required = True
         self.add_download_options(collection_parser, parents=[common, cache_options])
@@ -305,6 +300,7 @@ class GalaxyCLI(CLI):
 
         # Add sub parser for the Galaxy role actions
         role = type_parser.add_parser('role', help='Manage an Ansible Galaxy role.')
+        role.set_defaults(func=self.execute_role)  # to satisfy doc build
         role_parser = role.add_subparsers(metavar='ROLE_ACTION', dest='action')
         role_parser.required = True
         self.add_init_options(role_parser, parents=[common, force, offline])
@@ -363,6 +359,7 @@ class GalaxyCLI(CLI):
             init_parser.add_argument('--type', dest='role_type', action='store', default='default',
                                      help="Initialize using an alternate role type. Valid types include: 'container', "
                                           "'apb' and 'network'.")
+        opt_help.add_runtask_options(init_parser)
 
     def add_remove_options(self, parser, parents=None):
         remove_parser = parser.add_parser('remove', parents=parents, help='Delete roles from roles_path.')
@@ -463,12 +460,15 @@ class GalaxyCLI(CLI):
         valid_signature_count_help = 'The number of signatures that must successfully verify the collection. This should be a positive integer ' \
                                      'or all to signify that all signatures must be used to verify the collection. ' \
                                      'Prepend the value with + to fail if no valid signatures are found for the collection (e.g. +all).'
-        ignore_gpg_status_help = 'A status code to ignore during signature verification (for example, NO_PUBKEY). ' \
-                                 'Provide this option multiple times to ignore a list of status codes. ' \
-                                 'Descriptions for the choices can be seen at L(https://github.com/gpg/gnupg/blob/master/doc/DETAILS#general-status-codes).'
+        ignore_gpg_status_help = 'A space separated list of status codes to ignore during signature verification (for example, NO_PUBKEY FAILURE). ' \
+                                 'Descriptions for the choices can be seen at L(https://github.com/gpg/gnupg/blob/master/doc/DETAILS#general-status-codes).' \
+                                 'Note: specify these after positional arguments or use -- to separate them.'
         verify_parser.add_argument('--required-valid-signature-count', dest='required_valid_signature_count', type=validate_signature_count,
                                    help=valid_signature_count_help, default=C.GALAXY_REQUIRED_VALID_SIGNATURE_COUNT)
         verify_parser.add_argument('--ignore-signature-status-code', dest='ignore_gpg_errors', type=str, action='append',
+                                   help=opt_help.argparse.SUPPRESS, default=C.GALAXY_IGNORE_INVALID_SIGNATURE_STATUS_CODES,
+                                   choices=list(GPG_ERROR_MAP.keys()))
+        verify_parser.add_argument('--ignore-signature-status-codes', dest='ignore_gpg_errors', type=str, action='extend', nargs='+',
                                    help=ignore_gpg_status_help, default=C.GALAXY_IGNORE_INVALID_SIGNATURE_STATUS_CODES,
                                    choices=list(GPG_ERROR_MAP.keys()))
 
@@ -482,12 +482,31 @@ class GalaxyCLI(CLI):
             ignore_errors_help = 'Ignore errors during installation and continue with the next specified ' \
                                  'collection. This will not ignore dependency conflict errors.'
         else:
-            args_kwargs['help'] = 'Role name, URL or tar file'
+            args_kwargs['help'] = 'Role name, URL or tar file. This is mutually exclusive with -r.'
             ignore_errors_help = 'Ignore errors and continue with the next specified role.'
 
+        if self._implicit_role:
+            # might install both roles and collections
+            description_text = (
+                'Install roles and collections from file(s), URL(s) or Ansible '
+                'Galaxy to the first entry in the config COLLECTIONS_PATH for collections '
+                'and first entry in the config ROLES_PATH for roles. '
+                'The first entry in the config ROLES_PATH can be overridden by --roles-path '
+                'or -p, but this will result in only roles being installed.'
+            )
+            prog = 'ansible-galaxy install'
+        else:
+            prog = f"ansible-galaxy {galaxy_type} install"
+            description_text = (
+                'Install {0}(s) from file(s), URL(s) or Ansible '
+                'Galaxy to the first entry in the config {1}S_PATH '
+                'unless overridden by --{0}s-path.'.format(galaxy_type, galaxy_type.upper())
+            )
         install_parser = parser.add_parser('install', parents=parents,
                                            help='Install {0}(s) from file(s), URL(s) or Ansible '
-                                                'Galaxy'.format(galaxy_type))
+                                                'Galaxy'.format(galaxy_type),
+                                           description=description_text,
+                                           prog=prog,)
         install_parser.set_defaults(func=self.execute_install)
 
         install_parser.add_argument('args', metavar='{0}_name'.format(galaxy_type), nargs='*', **args_kwargs)
@@ -504,9 +523,9 @@ class GalaxyCLI(CLI):
         valid_signature_count_help = 'The number of signatures that must successfully verify the collection. This should be a positive integer ' \
                                      'or -1 to signify that all signatures must be used to verify the collection. ' \
                                      'Prepend the value with + to fail if no valid signatures are found for the collection (e.g. +all).'
-        ignore_gpg_status_help = 'A status code to ignore during signature verification (for example, NO_PUBKEY). ' \
-                                 'Provide this option multiple times to ignore a list of status codes. ' \
-                                 'Descriptions for the choices can be seen at L(https://github.com/gpg/gnupg/blob/master/doc/DETAILS#general-status-codes).'
+        ignore_gpg_status_help = 'A space separated list of status codes to ignore during signature verification (for example, NO_PUBKEY FAILURE). ' \
+                                 'Descriptions for the choices can be seen at L(https://github.com/gpg/gnupg/blob/master/doc/DETAILS#general-status-codes).' \
+                                 'Note: specify these after positional arguments or use -- to separate them.'
 
         if galaxy_type == 'collection':
             install_parser.add_argument('-p', '--collections-path', dest='collections_path',
@@ -530,6 +549,9 @@ class GalaxyCLI(CLI):
             install_parser.add_argument('--required-valid-signature-count', dest='required_valid_signature_count', type=validate_signature_count,
                                         help=valid_signature_count_help, default=C.GALAXY_REQUIRED_VALID_SIGNATURE_COUNT)
             install_parser.add_argument('--ignore-signature-status-code', dest='ignore_gpg_errors', type=str, action='append',
+                                        help=opt_help.argparse.SUPPRESS, default=C.GALAXY_IGNORE_INVALID_SIGNATURE_STATUS_CODES,
+                                        choices=list(GPG_ERROR_MAP.keys()))
+            install_parser.add_argument('--ignore-signature-status-codes', dest='ignore_gpg_errors', type=str, action='extend', nargs='+',
                                         help=ignore_gpg_status_help, default=C.GALAXY_IGNORE_INVALID_SIGNATURE_STATUS_CODES,
                                         choices=list(GPG_ERROR_MAP.keys()))
             install_parser.add_argument('--offline', dest='offline', action='store_true', default=False,
@@ -537,8 +559,12 @@ class GalaxyCLI(CLI):
                                              'This does not apply to collections in remote Git repositories or URLs to remote tarballs.'
                                         )
         else:
-            install_parser.add_argument('-r', '--role-file', dest='requirements',
-                                        help='A file containing a list of roles to be installed.')
+            if self._implicit_role:
+                install_parser.add_argument('-r', '--role-file', dest='requirements',
+                                            help='A file containing a list of collections and roles to be installed.')
+            else:
+                install_parser.add_argument('-r', '--role-file', dest='requirements',
+                                            help='A file containing a list of roles to be installed.')
 
             r_re = re.compile(r'^(?<!-)-[a-zA-Z]*r[a-zA-Z]*')  # -r, -fr
             contains_r = bool([a for a in self._raw_args if r_re.match(a)])
@@ -554,6 +580,9 @@ class GalaxyCLI(CLI):
                 install_parser.add_argument('--required-valid-signature-count', dest='required_valid_signature_count', type=validate_signature_count,
                                             help=valid_signature_count_help, default=C.GALAXY_REQUIRED_VALID_SIGNATURE_COUNT)
                 install_parser.add_argument('--ignore-signature-status-code', dest='ignore_gpg_errors', type=str, action='append',
+                                            help=opt_help.argparse.SUPPRESS, default=C.GALAXY_IGNORE_INVALID_SIGNATURE_STATUS_CODES,
+                                            choices=list(GPG_ERROR_MAP.keys()))
+                install_parser.add_argument('--ignore-signature-status-codes', dest='ignore_gpg_errors', type=str, action='extend', nargs='+',
                                             help=ignore_gpg_status_help, default=C.GALAXY_IGNORE_INVALID_SIGNATURE_STATUS_CODES,
                                             choices=list(GPG_ERROR_MAP.keys()))
 
@@ -604,25 +633,8 @@ class GalaxyCLI(CLI):
 
         self.galaxy = Galaxy()
 
-        def server_config_def(section, key, required, option_type):
-            config_def = {
-                'description': 'The %s of the %s Galaxy server' % (key, section),
-                'ini': [
-                    {
-                        'section': 'galaxy_server.%s' % section,
-                        'key': key,
-                    }
-                ],
-                'env': [
-                    {'name': 'ANSIBLE_GALAXY_SERVER_%s_%s' % (section.upper(), key.upper())},
-                ],
-                'required': required,
-                'type': option_type,
-            }
-            if key in SERVER_ADDITIONAL:
-                config_def.update(SERVER_ADDITIONAL[key])
-
-            return config_def
+        # dynamically add per server config depending on declared servers
+        C.config.load_galaxy_server_defs(C.GALAXY_SERVER_LIST)
 
         galaxy_options = {}
         for optional_key in ['clear_response_cache', 'no_cache']:
@@ -630,42 +642,23 @@ class GalaxyCLI(CLI):
                 galaxy_options[optional_key] = context.CLIARGS[optional_key]
 
         config_servers = []
-
         # Need to filter out empty strings or non truthy values as an empty server list env var is equal to [''].
         server_list = [s for s in C.GALAXY_SERVER_LIST or [] if s]
         for server_priority, server_key in enumerate(server_list, start=1):
-            # Abuse the 'plugin config' by making 'galaxy_server' a type of plugin
-            # Config definitions are looked up dynamically based on the C.GALAXY_SERVER_LIST entry. We look up the
-            # section [galaxy_server.<server>] for the values url, username, password, and token.
-            config_dict = dict((k, server_config_def(server_key, k, req, ensure_type)) for k, req, ensure_type in SERVER_DEF)
-            defs = AnsibleLoader(yaml_dump(config_dict)).get_single_data()
-            C.config.initialize_plugin_configuration_definitions('galaxy_server', server_key, defs)
 
             # resolve the config created options above with existing config and user options
-            server_options = C.config.get_plugin_options('galaxy_server', server_key)
+            server_options = C.config.get_plugin_options(plugin_type='galaxy_server', name=server_key)
 
             # auth_url is used to create the token, but not directly by GalaxyAPI, so
             # it doesn't need to be passed as kwarg to GalaxyApi, same for others we pop here
             auth_url = server_options.pop('auth_url')
             client_id = server_options.pop('client_id')
+            client_secret = server_options.pop('client_secret')
             token_val = server_options['token'] or NoTokenSentinel
             username = server_options['username']
-            api_version = server_options.pop('api_version')
             if server_options['validate_certs'] is None:
                 server_options['validate_certs'] = context.CLIARGS['resolved_validate_certs']
             validate_certs = server_options['validate_certs']
-
-            # This allows a user to explicitly force use of an API version when
-            # multiple versions are supported. This was added for testing
-            # against pulp_ansible and I'm not sure it has a practical purpose
-            # outside of this use case. As such, this option is not documented
-            # as of now
-            if api_version:
-                display.warning(
-                    f'The specified "api_version" configuration for the galaxy server "{server_key}" is '
-                    'not a public configuration, and may be removed at any time without warning.'
-                )
-                server_options['available_api_versions'] = {'v%s' % api_version: '/v%s' % api_version}
 
             # default case if no auth info is provided.
             server_options['token'] = None
@@ -673,15 +666,17 @@ class GalaxyCLI(CLI):
             if username:
                 server_options['token'] = BasicAuthToken(username, server_options['password'])
             else:
-                if token_val:
-                    if auth_url:
-                        server_options['token'] = KeycloakToken(access_token=token_val,
-                                                                auth_url=auth_url,
-                                                                validate_certs=validate_certs,
-                                                                client_id=client_id)
-                    else:
-                        # The galaxy v1 / github / django / 'Token'
-                        server_options['token'] = GalaxyToken(token=token_val)
+                if auth_url:
+                    server_options['token'] = KeycloakToken(
+                        access_token=token_val,
+                        auth_url=auth_url,
+                        validate_certs=validate_certs,
+                        client_id=client_id,
+                        client_secret=client_secret,
+                    )
+                elif token_val:
+                    # The galaxy v1 / github / django / 'Token'
+                    server_options['token'] = GalaxyToken(token=token_val)
 
             server_options.update(galaxy_options)
             config_servers.append(GalaxyAPI(
@@ -691,12 +686,6 @@ class GalaxyCLI(CLI):
             ))
 
         cmd_server = context.CLIARGS['api_server']
-        if context.CLIARGS['api_version']:
-            api_version = context.CLIARGS['api_version']
-            display.warning(
-                'The --api-version is not a public argument, and may be removed at any time without warning.'
-            )
-            galaxy_options['available_api_versions'] = {'v%s' % api_version: '/v%s' % api_version}
 
         cmd_token = GalaxyToken(token=context.CLIARGS['api_key'])
 
@@ -822,7 +811,7 @@ class GalaxyCLI(CLI):
             for role_req in file_requirements:
                 requirements['roles'] += parse_role_req(role_req)
 
-        else:
+        elif isinstance(file_requirements, dict):
             # Newer format with a collections and/or roles key
             extra_keys = set(file_requirements.keys()).difference(set(['roles', 'collections']))
             if extra_keys:
@@ -840,6 +829,9 @@ class GalaxyCLI(CLI):
                 )
                 for collection_req in file_requirements.get('collections') or []
             ]
+
+        else:
+            raise AnsibleError(f"Expecting requirements yaml to be a list or dictionary but got {type(file_requirements).__name__}")
 
         return requirements
 
@@ -918,8 +910,8 @@ class GalaxyCLI(CLI):
 
     @staticmethod
     def _get_skeleton_galaxy_yml(template_path, inject_data):
-        with open(to_bytes(template_path, errors='surrogate_or_strict'), 'rb') as template_obj:
-            meta_template = to_text(template_obj.read(), errors='surrogate_or_strict')
+        with open(to_bytes(template_path, errors='surrogate_or_strict'), 'r') as template_obj:
+            meta_template = TrustedAsTemplate().tag(to_text(template_obj.read(), errors='surrogate_or_strict'))
 
         galaxy_meta = get_collections_galaxy_meta_info()
 
@@ -955,7 +947,7 @@ class GalaxyCLI(CLI):
             return textwrap.fill(v, width=117, initial_indent="# ", subsequent_indent="# ", break_on_hyphens=False)
 
         loader = DataLoader()
-        templar = Templar(loader, variables={'required_config': required_config, 'optional_config': optional_config})
+        templar = TemplateEngine(loader, variables={'required_config': required_config, 'optional_config': optional_config})
         templar.environment.filters['comment_ify'] = comment_ify
 
         meta_value = templar.template(meta_template)
@@ -1039,6 +1031,7 @@ class GalaxyCLI(CLI):
 
     @with_collection_artifacts_manager
     def execute_download(self, artifacts_manager=None):
+        """Download collections and their dependencies as a tarball for an offline install."""
         collections = context.CLIARGS['args']
         no_deps = context.CLIARGS['no_deps']
         download_path = context.CLIARGS['download_path']
@@ -1147,7 +1140,18 @@ class GalaxyCLI(CLI):
             skeleton_ignore_expressions = ['^.*/.git_keep$']
 
         obj_skeleton = os.path.expanduser(obj_skeleton)
-        skeleton_ignore_re = [re.compile(x) for x in skeleton_ignore_expressions]
+        failed_re_expressions = ""
+        skeleton_ignore_re = []
+        for x in skeleton_ignore_expressions:
+            try:
+                skeleton_ignore_re.append(re.compile(x))
+            except re.error as e:
+                failed_re_expressions += f"- {x}: {str(e)}\n"
+                continue
+        if failed_re_expressions:
+            raise AnsibleError(
+                f"Failed to compile regular expressions for skeleton ignore: \n{failed_re_expressions}"
+            )
 
         if not os.path.exists(obj_skeleton):
             raise AnsibleError("- the skeleton path '{0}' does not exist, cannot init {1}".format(
@@ -1155,7 +1159,8 @@ class GalaxyCLI(CLI):
             )
 
         loader = DataLoader()
-        templar = Templar(loader, variables=inject_data)
+        inject_data.update(load_extra_vars(loader))
+        templar = TemplateEngine(loader, variables=inject_data)
 
         # create role directory
         if not os.path.exists(b_obj_path):
@@ -1197,8 +1202,12 @@ class GalaxyCLI(CLI):
                 elif ext == ".j2" and not in_templates_dir:
                     src_template = os.path.join(root, f)
                     dest_file = os.path.join(obj_path, rel_root, filename)
-                    template_data = to_text(loader._get_file_contents(src_template)[0], errors='surrogate_or_strict')
-                    b_rendered = to_bytes(templar.template(template_data), errors='surrogate_or_strict')
+                    template_data = trust_as_template(loader.get_text_file_contents(src_template))
+                    try:
+                        b_rendered = to_bytes(templar.template(template_data), errors='surrogate_or_strict')
+                    except AnsibleError as e:
+                        shutil.rmtree(b_obj_path)
+                        raise AnsibleError(f"Failed to create {galaxy_type.title()} {obj_name}. Templating {src_template} failed with the error: {e}") from e
                     with open(dest_file, 'wb') as df:
                         df.write(b_rendered)
                 else:
@@ -1251,6 +1260,9 @@ class GalaxyCLI(CLI):
 
                 if remote_data:
                     role_info.update(remote_data)
+                else:
+                    data = u"- the role %s was not found" % role
+                    break
 
             elif context.CLIARGS['offline'] and not gr._exists:
                 data = u"- the role %s was not found" % role
@@ -1270,9 +1282,10 @@ class GalaxyCLI(CLI):
 
     @with_collection_artifacts_manager
     def execute_verify(self, artifacts_manager=None):
+        """Compare checksums with the collection(s) found on the server and the installed copy. This does not verify dependencies."""
 
         collections = context.CLIARGS['args']
-        search_paths = AnsibleCollectionConfig.collection_paths
+        search_paths = self.collection_paths
         ignore_errors = context.CLIARGS['ignore_errors']
         local_verify_only = context.CLIARGS['offline']
         requirements_file = context.CLIARGS['requirements']
@@ -1307,8 +1320,6 @@ class GalaxyCLI(CLI):
         You can pass in a list (roles or collections) or use the file
         option listed below (these are mutually exclusive). If you pass in a list, it
         can be a name (which will be downloaded via the galaxy API and github), or it can be a local tar archive file.
-
-        :param artifacts_manager: Artifacts manager.
         """
         install_items = context.CLIARGS['args']
         requirements_file = context.CLIARGS['requirements']
@@ -1414,10 +1425,19 @@ class GalaxyCLI(CLI):
         upgrade = context.CLIARGS.get('upgrade', False)
 
         collections_path = C.COLLECTIONS_PATHS
-        if (
-            C.GALAXY_COLLECTIONS_PATH_WARNING
-            and len([p for p in collections_path if p.startswith(path)]) == 0
-        ):
+
+        managed_paths = set(validate_collection_path(p) for p in C.COLLECTIONS_PATHS)
+        read_req_paths = set(validate_collection_path(p) for p in self.collection_paths)
+
+        unexpected_path = C.GALAXY_COLLECTIONS_PATH_WARNING and not any(p.startswith(path) for p in managed_paths)
+        if unexpected_path and any(p.startswith(path) for p in read_req_paths):
+            display.warning(
+                f"The specified collections path '{path}' appears to be part of the pip Ansible package. "
+                "Managing these directly with ansible-galaxy could break the Ansible package. "
+                "Install collections to a configured collections path, which will take precedence over "
+                "collections found in the PYTHONPATH."
+            )
+        elif unexpected_path:
             display.warning("The specified collections path '%s' is not part of the configured Ansible "
                             "collections paths '%s'. The installed collection will not be picked up in an Ansible "
                             "run, unless within a playbook-adjacent collections directory." % (to_text(path), to_text(":".join(collections_path))))
@@ -1434,6 +1454,7 @@ class GalaxyCLI(CLI):
             artifacts_manager=artifacts_manager,
             disable_gpg_verify=disable_gpg_verify,
             offline=context.CLIARGS.get('offline', False),
+            read_requirement_paths=read_req_paths,
         )
 
         return 0
@@ -1602,8 +1623,8 @@ class GalaxyCLI(CLI):
             display.warning(w)
 
         if not path_found:
-            raise AnsibleOptionsError(
-                "- None of the provided paths were usable. Please specify a valid path with --{0}s-path".format(context.CLIARGS['type'])
+            display.warning(
+                "None of the provided paths were usable. Please specify a valid path with --{0}s-path.".format(context.CLIARGS['type'])
             )
 
         return 0
@@ -1622,7 +1643,7 @@ class GalaxyCLI(CLI):
         collection_name = context.CLIARGS['collection']
         default_collections_path = set(C.COLLECTIONS_PATHS)
         collections_search_paths = (
-            set(context.CLIARGS['collections_path'] or []) | default_collections_path | set(AnsibleCollectionConfig.collection_paths)
+            set(context.CLIARGS['collections_path'] or []) | default_collections_path | set(self.collection_paths)
         )
         collections_in_paths = {}
 
@@ -1687,8 +1708,8 @@ class GalaxyCLI(CLI):
             display.warning(w)
 
         if not collections and not path_found:
-            raise AnsibleOptionsError(
-                "- None of the provided paths were usable. Please specify a valid path with --{0}s-path".format(context.CLIARGS['type'])
+            display.warning(
+                "None of the provided paths were usable. Please specify a valid path with --{0}s-path.".format(context.CLIARGS['type'])
             )
 
         if output_format == 'json':
@@ -1709,7 +1730,7 @@ class GalaxyCLI(CLI):
         publish_collection(collection_path, self.api, wait, timeout)
 
     def execute_search(self):
-        ''' searches for roles on the Ansible Galaxy server'''
+        """ searches for roles on the Ansible Galaxy server"""
         page_size = 1000
         search = None
 
@@ -1749,6 +1770,8 @@ class GalaxyCLI(CLI):
 
         return 0
 
+    _task_check_delay_sec = 10  # allows unit test override
+
     def execute_import(self):
         """ used to import a role into Ansible Galaxy """
 
@@ -1763,6 +1786,7 @@ class GalaxyCLI(CLI):
         github_user = to_text(context.CLIARGS['github_user'], errors='surrogate_or_strict')
         github_repo = to_text(context.CLIARGS['github_repo'], errors='surrogate_or_strict')
 
+        rc = 0
         if context.CLIARGS['check_status']:
             task = self.api.get_import_task(github_user=github_user, github_repo=github_repo)
         else:
@@ -1780,7 +1804,7 @@ class GalaxyCLI(CLI):
                     display.display('%s.%s' % (t['summary_fields']['role']['namespace'], t['summary_fields']['role']['name']), color=C.COLOR_CHANGED)
                 display.display(u'\nTo properly namespace this role, remove each of the above and re-import %s/%s from scratch' % (github_user, github_repo),
                                 color=C.COLOR_CHANGED)
-                return 0
+                return rc
             # found a single role as expected
             display.display("Successfully submitted import request %d" % task[0]['id'])
             if not context.CLIARGS['wait']:
@@ -1797,12 +1821,13 @@ class GalaxyCLI(CLI):
                     if msg['id'] not in msg_list:
                         display.display(msg['message_text'], color=colors[msg['message_type']])
                         msg_list.append(msg['id'])
-                if task[0]['state'] in ['SUCCESS', 'FAILED']:
+                if (state := task[0]['state']) in ['SUCCESS', 'FAILED']:
+                    rc = ['SUCCESS', 'FAILED'].index(state)
                     finished = True
                 else:
-                    time.sleep(10)
+                    time.sleep(self._task_check_delay_sec)
 
-        return 0
+        return rc
 
     def execute_setup(self):
         """ Setup an integration from Github or Travis for Ansible Galaxy roles"""

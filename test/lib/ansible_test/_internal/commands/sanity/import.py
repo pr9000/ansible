@@ -1,4 +1,5 @@
 """Sanity test for proper import exception handling."""
+
 from __future__ import annotations
 
 import collections.abc as c
@@ -47,11 +48,6 @@ from ...ansible_util import (
     ansible_environment,
 )
 
-from ...python_requirements import (
-    PipUnavailableError,
-    install_requirements,
-)
-
 from ...config import (
     SanityConfig,
 )
@@ -66,10 +62,6 @@ from ...data import (
 
 from ...host_configs import (
     PythonConfig,
-)
-
-from ...venv import (
-    get_virtualenv_version,
 )
 
 
@@ -109,15 +101,6 @@ class ImportTest(SanityMultipleVersion):
 
         paths = [target.path for target in targets.include]
 
-        if python.version.startswith('2.') and (get_virtualenv_version(args, python.path) or (0,)) < (13,):
-            # hack to make sure that virtualenv is available under Python 2.x
-            # on Python 3.x we can use the built-in venv
-            # version 13+ is required to use the `--no-wheel` option
-            try:
-                install_requirements(args, python, virtualenv=True, controller=False)  # sanity (import)
-            except PipUnavailableError as ex:
-                display.warning(str(ex))
-
         temp_root = os.path.join(ResultType.TMP.path, 'sanity', 'import')
 
         messages = []
@@ -146,7 +129,7 @@ class ImportTest(SanityMultipleVersion):
                 display.warning(f'Skipping sanity test "{self.name}" on Python {python.version} due to missing virtual environment support.')
                 return SanitySkipped(self.name, python.version)
 
-            virtualenv_yaml = check_sanity_virtualenv_yaml(virtualenv_python)
+            virtualenv_yaml = args.explain or check_sanity_virtualenv_yaml(virtualenv_python)
 
             if virtualenv_yaml is False:
                 display.warning(f'Sanity test "{self.name}" ({import_type}) on Python {python.version} may be slow due to missing libyaml support in PyYAML.')

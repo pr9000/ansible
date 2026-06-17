@@ -2,8 +2,7 @@
 # Copyright: (c) 2019, Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import collections
 import datetime
@@ -26,7 +25,6 @@ from ansible.errors import AnsibleError
 from ansible.galaxy.user_agent import user_agent
 from ansible.module_utils.api import retry_with_delays_and_condition
 from ansible.module_utils.api import generate_jittered_backoff
-from ansible.module_utils.six import string_types
 from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
 from ansible.module_utils.urls import open_url, prepare_multipart
 from ansible.utils.display import Display
@@ -58,14 +56,13 @@ def should_retry_error(exception):
     if isinstance(exception, GalaxyError) and exception.http_code in RETRY_HTTP_ERROR_CODES:
         return True
 
-    if isinstance(exception, AnsibleError) and (orig_exc := getattr(exception, 'orig_exc', None)):
+    if isinstance(exception, AnsibleError) and (cause := exception.__cause__):
         # URLError is often a proxy for an underlying error, handle wrapped exceptions
-        if isinstance(orig_exc, URLError):
-            orig_exc = orig_exc.reason
+        if isinstance(cause, URLError):
+            cause = cause.reason
 
-        # Handle common URL related errors such as TimeoutError, and BadStatusLine
-        # Note: socket.timeout is only required for Py3.9
-        if isinstance(orig_exc, (TimeoutError, BadStatusLine, IncompleteRead)):
+        # Handle common URL related errors
+        if isinstance(cause, (TimeoutError, BadStatusLine, IncompleteRead)):
             return True
 
     return False
@@ -94,7 +91,7 @@ def g_connect(versions):
                 try:
                     data = self._call_galaxy(n_url, method='GET', error_context_msg=error_context_msg, cache=True)
                 except (AnsibleError, GalaxyError, ValueError, KeyError) as err:
-                    # Either the URL doesnt exist, or other error. Or the URL exists, but isn't a galaxy API
+                    # Either the URL doesn't exist, or other error. Or the URL exists, but isn't a galaxy API
                     # root (not JSON, no 'available_versions') so try appending '/api/'
                     if n_url.endswith('/api') or n_url.endswith('/api/'):
                         raise
@@ -116,13 +113,7 @@ def g_connect(versions):
                 # url + '/api/' appended.
                 self.api_server = n_url
 
-                # Default to only supporting v1, if only v1 is returned we also assume that v2 is available even though
-                # it isn't returned in the available_versions dict.
-                available_versions = data.get('available_versions', {u'v1': u'v1/'})
-                if list(available_versions.keys()) == [u'v1']:
-                    available_versions[u'v2'] = u'v2/'
-
-                self._available_api_versions = available_versions
+                self._available_api_versions = available_versions = data['available_versions']
                 display.vvvv("Found API version '%s' with Galaxy server %s (%s)"
                              % (', '.join(available_versions.keys()), self.name, self.api_server))
 
@@ -207,11 +198,7 @@ class GalaxyError(AnsibleError):
             err_info = {}
 
         url_split = self.url.split('/')
-        if 'v2' in url_split:
-            galaxy_msg = err_info.get('message', http_error.reason)
-            code = err_info.get('code', 'Unknown')
-            full_error_msg = u"%s (HTTP Code: %d, Message: %s Code: %s)" % (message, self.http_code, galaxy_msg, code)
-        elif 'v3' in url_split:
+        if 'v3' in url_split:
             errors = err_info.get('errors', [])
             if not errors:
                 errors = [{}]  # Defaults are set below, we just need to make sure 1 error is present.
@@ -301,6 +288,8 @@ class GalaxyAPI:
         if not no_cache:
             self._cache = _load_cache(self._b_cache_path)
 
+        self.requires_ansible = collections.defaultdict(dict)
+
         display.debug('Validate TLS certificates for %s: %s' % (self.api_server, self.validate_certs))
 
     def __str__(self):
@@ -330,13 +319,10 @@ class GalaxyAPI:
         if not isinstance(other_galaxy_api, self.__class__):
             return NotImplemented
 
-        return (
-            self._priority > other_galaxy_api._priority or
-            self.name < self.name
-        )
+        return self._priority > other_galaxy_api._priority
 
     @property  # type: ignore[misc]  # https://github.com/python/mypy/issues/1362
-    @g_connect(['v1', 'v2', 'v3'])
+    @g_connect(['v1', 'v3'])
     def available_api_versions(self):
         # Calling g_connect will populate self._available_api_versions
         return self._available_api_versions
@@ -359,7 +345,8 @@ class GalaxyAPI:
             valid = False
             if cache_key in server_cache:
                 expires = datetime.datetime.strptime(server_cache[cache_key]['expires'], iso_datetime_format)
-                valid = datetime.datetime.utcnow() < expires
+                expires = expires.replace(tzinfo=datetime.timezone.utc)
+                valid = datetime.datetime.now(datetime.timezone.utc) < expires
 
             is_paginated_url = 'page' in query or 'offset' in query
             if valid and not is_paginated_url:
@@ -378,13 +365,21 @@ class GalaxyAPI:
                         res['results'].append(result)
 
                 else:
-                    res = path_cache['results']
+                    try:
+                        res = path_cache['results']
+                    except KeyError as cache_miss_error:
+                        raise AnsibleError(
+                            f"Missing expected 'results' in ansible-galaxy cache: {path_cache!r}. "
+                            "This may indicate cache corruption (for example, from concurrent ansible-galaxy runs) "
+                            "or a bug in how the cache was generated. "
+                            "Try running with --clear-response-cache or --no-cache to work around the issue."
+                        ) from cache_miss_error
 
                 return res
 
             elif not is_paginated_url:
                 # The cache entry had expired or does not exist, start a new blank entry to be filled later.
-                expires = datetime.datetime.utcnow()
+                expires = datetime.datetime.now(datetime.timezone.utc)
                 expires += datetime.timedelta(days=1)
                 server_cache[cache_key] = {
                     'expires': expires.strftime(iso_datetime_format),
@@ -400,11 +395,8 @@ class GalaxyAPI:
                             method=method, timeout=self._server_timeout, http_agent=user_agent(), follow_redirects='safe')
         except HTTPError as e:
             raise GalaxyError(e, error_context_msg)
-        except Exception as e:
-            raise AnsibleError(
-                "Unknown error when attempting to call Galaxy at '%s': %s" % (url, to_native(e)),
-                orig_exc=e
-            )
+        except Exception as ex:
+            raise AnsibleError(f"Unknown error when attempting to call Galaxy at {url!r}.") from ex
 
         resp_data = to_text(resp.read(), errors='surrogate_or_strict')
         try:
@@ -463,8 +455,8 @@ class GalaxyAPI:
             resp = open_url(url, data=args, validate_certs=self.validate_certs, method="POST", http_agent=user_agent(), timeout=self._server_timeout)
         except HTTPError as e:
             raise GalaxyError(e, 'Attempting to authenticate to galaxy')
-        except Exception as e:
-            raise AnsibleError('Unable to authenticate to galaxy: %s' % to_native(e), orig_exc=e)
+        except Exception as ex:
+            raise AnsibleError('Unable to authenticate to galaxy.') from ex
 
         data = json.loads(to_text(resp.read(), errors='surrogate_or_strict'))
         return data
@@ -482,8 +474,6 @@ class GalaxyAPI:
         }
         if role_name:
             args['alternate_role_name'] = role_name
-        elif github_repo.startswith('ansible-role'):
-            args['alternate_role_name'] = github_repo[len('ansible-role') + 1:]
         data = self._call_galaxy(url, args=urlencode(args), method="POST")
         if data.get('results', None):
             return data['results']
@@ -595,11 +585,11 @@ class GalaxyAPI:
         page_size = kwargs.get('page_size', None)
         author = kwargs.get('author', None)
 
-        if tags and isinstance(tags, string_types):
+        if tags and isinstance(tags, str):
             tags = tags.split(',')
             search_url += '&tags_autocomplete=' + '+'.join(tags)
 
-        if platforms and isinstance(platforms, string_types):
+        if platforms and isinstance(platforms, str):
             platforms = platforms.split(',')
             search_url += '&platforms_autocomplete=' + '+'.join(platforms)
 
@@ -645,7 +635,7 @@ class GalaxyAPI:
 
     # Collection APIs #
 
-    @g_connect(['v2', 'v3'])
+    @g_connect(['v3'])
     def publish_collection(self, collection_path):
         """
         Publishes a collection to a Galaxy server and returns the import task URI.
@@ -680,19 +670,15 @@ class GalaxyAPI:
             'Content-length': len(b_form_data),
         }
 
-        if 'v3' in self.available_api_versions:
-            n_url = _urljoin(self.api_server, self.available_api_versions['v3'], 'artifacts', 'collections') + '/'
-        else:
-            n_url = _urljoin(self.api_server, self.available_api_versions['v2'], 'collections') + '/'
-
+        n_url = _urljoin(self.api_server, self.available_api_versions['v3'], 'artifacts', 'collections') + '/'
         resp = self._call_galaxy(n_url, args=b_form_data, headers=headers, method='POST', auth_required=True,
                                  error_context_msg='Error when publishing collection to %s (%s)'
                                                    % (self.name, self.api_server))
 
-        return resp['task']
+        return urljoin(self.api_server, resp['task'])
 
-    @g_connect(['v2', 'v3'])
-    def wait_import_task(self, task_id, timeout=0):
+    @g_connect(['v3'])
+    def wait_import_task(self, task_url, timeout=0):
         """
         Waits until the import process on the Galaxy server has completed or the timeout is reached.
 
@@ -703,22 +689,14 @@ class GalaxyAPI:
         state = 'waiting'
         data = None
 
-        # Construct the appropriate URL per version
-        if 'v3' in self.available_api_versions:
-            full_url = _urljoin(self.api_server, self.available_api_versions['v3'],
-                                'imports/collections', task_id, '/')
-        else:
-            full_url = _urljoin(self.api_server, self.available_api_versions['v2'],
-                                'collection-imports', task_id, '/')
-
-        display.display("Waiting until Galaxy import task %s has completed" % full_url)
+        display.display("Waiting until Galaxy import task %s has completed" % task_url)
         start = time.time()
-        wait = 2
+        wait = C.GALAXY_COLLECTION_IMPORT_POLL_INTERVAL
 
         while timeout == 0 or (time.time() - start) < timeout:
             try:
-                data = self._call_galaxy(full_url, method='GET', auth_required=True,
-                                         error_context_msg='Error when getting import task results at %s' % full_url)
+                data = self._call_galaxy(task_url, method='GET', auth_required=True,
+                                         error_context_msg='Error when getting import task results at %s' % task_url)
             except GalaxyError as e:
                 if e.http_code != 404:
                     raise
@@ -737,10 +715,10 @@ class GalaxyAPI:
             time.sleep(wait)
 
             # poor man's exponential backoff algo so we don't flood the Galaxy API, cap at 30 seconds.
-            wait = min(30, wait * 1.5)
+            wait = min(30, wait * C.GALAXY_COLLECTION_IMPORT_POLL_FACTOR)
         if state == 'waiting':
             raise AnsibleError("Timeout while waiting for the Galaxy import process to finish, check progress at '%s'"
-                               % to_native(full_url))
+                               % to_native(task_url))
 
         for message in data.get('messages', []):
             level = message['level']
@@ -754,10 +732,10 @@ class GalaxyAPI:
         if state == 'failed':
             code = to_native(data['error'].get('code', 'UNKNOWN'))
             description = to_native(
-                data['error'].get('description', "Unknown error, see %s for more details" % full_url))
+                data['error'].get('description', "Unknown error, see %s for more details" % task_url))
             raise AnsibleError("Galaxy import process failed: %s (Code: %s)" % (description, code))
 
-    @g_connect(['v2', 'v3'])
+    @g_connect(['v3'])
     def get_collection_metadata(self, namespace, name):
         """
         Gets the collection information from the Galaxy server about a specific Collection.
@@ -766,18 +744,11 @@ class GalaxyAPI:
         :param name: The collection name.
         return: CollectionMetadata about the collection.
         """
-        if 'v3' in self.available_api_versions:
-            api_path = self.available_api_versions['v3']
-            field_map = [
-                ('created_str', 'created_at'),
-                ('modified_str', 'updated_at'),
-            ]
-        else:
-            api_path = self.available_api_versions['v2']
-            field_map = [
-                ('created_str', 'created'),
-                ('modified_str', 'modified'),
-            ]
+        api_path = self.available_api_versions['v3']
+        field_map = [
+            ('created_str', 'created_at'),
+            ('modified_str', 'updated_at'),
+        ]
 
         info_url = _urljoin(self.api_server, api_path, 'collections', namespace, name, '/')
         error_context_msg = 'Error when getting the collection info for %s.%s from %s (%s)' \
@@ -790,7 +761,7 @@ class GalaxyAPI:
 
         return CollectionMetadata(namespace, name, **metadata)
 
-    @g_connect(['v2', 'v3'])
+    @g_connect(['v3'])
     def get_collection_version_metadata(self, namespace, name, version):
         """
         Gets the collection information from the Galaxy server about a specific Collection version.
@@ -800,7 +771,7 @@ class GalaxyAPI:
         :param version: Version of the collection to get the information for.
         :return: CollectionVersionMetadata about the collection at the version requested.
         """
-        api_path = self.available_api_versions.get('v3', self.available_api_versions.get('v2'))
+        api_path = self.available_api_versions['v3']
         url_paths = [self.api_server, api_path, 'collections', namespace, name, 'versions', version, '/']
 
         n_collection_url = _urljoin(*url_paths)
@@ -811,11 +782,25 @@ class GalaxyAPI:
 
         signatures = data.get('signatures') or []
 
+        # NOTE: Galaxy and Hub already populated the cache when listing versions.
+        # NOTE: Allow 3rd party servers to provide version-specific metadata lazily.
+        if (requires_ansible := data.get('requires_ansible')):
+            self.requires_ansible[f"{namespace}.{name}"][version] = requires_ansible
+
+        download_url_info = urlparse(data['download_url'])
+        if not download_url_info.scheme and not download_url_info.path.startswith('/'):
+            # galaxy does a lot of redirects, with much more complex pathing than we use
+            # within this codebase, without updating _call_galaxy to be able to return
+            # the final URL, we can't reliably build a relative URL.
+            raise AnsibleError(f'Invalid non absolute download_url: {data["download_url"]}')
+
+        download_url = urljoin(self.api_server, data['download_url'])
+
         return CollectionVersionMetadata(data['namespace']['name'], data['collection']['name'], data['version'],
-                                         data['download_url'], data['artifact']['sha256'],
+                                         download_url, data['artifact']['sha256'],
                                          data['metadata']['dependencies'], data['href'], signatures)
 
-    @g_connect(['v2', 'v3'])
+    @g_connect(['v3'])
     def get_collection_versions(self, namespace, name):
         """
         Gets a list of available versions for a collection on a Galaxy server.
@@ -824,17 +809,10 @@ class GalaxyAPI:
         :param name: The collection name.
         :return: A list of versions that are available.
         """
-        relative_link = False
-        if 'v3' in self.available_api_versions:
-            api_path = self.available_api_versions['v3']
-            pagination_path = ['links', 'next']
-            relative_link = True  # AH pagination results are relative an not an absolute URI.
-        else:
-            api_path = self.available_api_versions['v2']
-            pagination_path = ['next']
+        api_path = self.available_api_versions['v3']
+        pagination_path = ['links', 'next']
 
-        page_size_name = 'limit' if 'v3' in self.available_api_versions else 'page_size'
-        versions_url = _urljoin(self.api_server, api_path, 'collections', namespace, name, 'versions', '/?%s=%d' % (page_size_name, COLLECTION_PAGE_SIZE))
+        versions_url = _urljoin(self.api_server, api_path, 'collections', namespace, name, 'versions', '/?limit=%d' % COLLECTION_PAGE_SIZE)
         versions_url_info = urlparse(versions_url)
         cache_key = versions_url_info.path
 
@@ -868,7 +846,7 @@ class GalaxyAPI:
         except GalaxyError as err:
             if err.http_code != 404:
                 raise
-            # v3 doesn't raise a 404 so we need to mimick the empty response from APIs that do.
+            # v3 doesn't raise a 404 so we need to mimic the empty response from APIs that do.
             return []
 
         if 'data' in data:
@@ -881,7 +859,10 @@ class GalaxyAPI:
 
         versions = []
         while True:
-            versions += [v['version'] for v in data[results_key]]
+            for v in data[results_key]:
+                versions.append(v["version"])
+                # requires_ansible is new in galaxy_ng 4.3.0
+                self.requires_ansible[f"{namespace}.{name}"][v["version"]] = v.get("requires_ansible")
 
             next_link = data
             for path in pagination_path:
@@ -889,13 +870,10 @@ class GalaxyAPI:
 
             if not next_link:
                 break
-            elif relative_link:
-                # TODO: This assumes the pagination result is relative to the root server. Will need to be verified
-                # with someone who knows the AH API.
-
-                # Remove the query string from the versions_url to use the next_link's query
-                versions_url = urljoin(versions_url, urlparse(versions_url).path)
-                next_link = versions_url.replace(versions_url_info.path, next_link)
+            next_link_info = urlparse(next_link)
+            if not next_link_info.scheme and not next_link_info.path.startswith('/'):
+                raise AnsibleError(f'Invalid non absolute pagination link: {next_link}')
+            next_link = urljoin(self.api_server, next_link)
 
             data = self._call_galaxy(to_native(next_link, errors='surrogate_or_strict'),
                                      error_context_msg=error_context_msg, cache=True, cache_key=cache_key)
@@ -903,7 +881,7 @@ class GalaxyAPI:
 
         return versions
 
-    @g_connect(['v2', 'v3'])
+    @g_connect(['v3'])
     def get_collection_signatures(self, namespace, name, version):
         """
         Gets the collection signatures from the Galaxy server about a specific Collection version.
@@ -913,7 +891,7 @@ class GalaxyAPI:
         :param version: Version of the collection to get the information for.
         :return: A list of signature strings.
         """
-        api_path = self.available_api_versions.get('v3', self.available_api_versions.get('v2'))
+        api_path = self.available_api_versions['v3']
         url_paths = [self.api_server, api_path, 'collections', namespace, name, 'versions', version, '/']
 
         n_collection_url = _urljoin(*url_paths)

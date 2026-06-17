@@ -1,4 +1,5 @@
 """Show information about the test environment."""
+
 from __future__ import annotations
 
 import datetime
@@ -35,6 +36,7 @@ from ...docker_util import (
 )
 
 from ...constants import (
+    TIMEOUT_MARGIN_SECONDS,
     TIMEOUT_PATH,
 )
 
@@ -49,6 +51,7 @@ from ...timeout import (
 
 class EnvConfig(CommonConfig):
     """Configuration for the `env` command."""
+
     def __init__(self, args: t.Any) -> None:
         super().__init__(args, 'env')
 
@@ -60,6 +63,9 @@ class EnvConfig(CommonConfig):
         if not self.show and not self.dump and self.timeout is None and not self.list_files:
             # default to --show if no options were given
             self.show = True
+
+        if self.list_files:
+            self.display_stderr = True
 
 
 def command_env(args: EnvConfig) -> None:
@@ -120,7 +126,7 @@ def list_files_env(args: EnvConfig) -> None:
         return
 
     for path in data_context().content.all_files():
-        display.info(path)
+        print(path)  # display goes to stderr, this should be on stdout
 
 
 def set_timeout(args: EnvConfig) -> None:
@@ -132,6 +138,9 @@ def set_timeout(args: EnvConfig) -> None:
 
     if timeout:
         display.info(f'Setting a {timeout.duration} minute test timeout which will end at: {timeout.deadline}', verbosity=1)
+
+        if timeout.duration * 60 <= TIMEOUT_MARGIN_SECONDS:
+            display.warning(f'The {timeout.duration} minute timeout may be too short for the faulthandler callback to provide useful diagnostics.')
     else:
         display.info('Clearing existing test timeout.', verbosity=1)
 

@@ -1,29 +1,37 @@
 DOCUMENTATION:
   name: strftime
   version_added: "2.4"
-  short_description: date formating
+  short_description: Returns date and/or time
   description:
-    - Using Python's C(strftime) function, take a data formating string and a date/time to create a formated date.
+    - Using Python's L(strftime, https://docs.python.org/3/library/datetime.html#datetime.datetime.strftime) function, take a data formatting string and a date/time to create a formatted date.
   notes:
-    - This is a passthrough to Python's C(stftime), for a complete set of formatting options go to https://strftime.org/.
+    - This is a passthrough to Python's C(datetime.datetime.strftime), for a complete set of formatting options go to L(the Python documentation, https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes).
+    - Before Ansible Core 2.21, this was based upon C(time.strftime) Python API.
   positional: _input, second, utc
   options:
     _input:
       description:
-        - A formating string following C(stftime) conventions.
+        - A formatting string following C(strftime) conventions.
+        - Some additional directives are not supported by all platforms. See Python documentation for more details.
         - See L(the Python documentation, https://docs.python.org/3/library/datetime.html#strftime-strptime-behavior) for a reference.
       type: str
       required: true
     second:
-      description: Datetime in seconds from C(epoch) to format, if not supplied C(gmttime/localtime) will be used.
+      description:
+        - A datetime in seconds from C(epoch) to format.
+        - If not supplied, the current time based on C(time.time()) will be used.
       type: int
     utc:
-      description: Whether time supplied is in UTC.
+      description:
+        - Whether time supplied is in UTC.
+        - If C(utc) is true, the time will be in UTC, otherwise it will be in the local timezone.
+        - Before Ansible Core 2.21, this was based upon C(time.strftime) Python API.
       type: bool
       default: false
+      version_added: '2.14'
 
 EXAMPLES: |
-  # for a complete set of features go to  https://strftime.org/
+  # for a complete set of features go to https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes
 
   # Display year-month-day
   {{ '%Y-%m-%d' | strftime }}
@@ -39,15 +47,7 @@ EXAMPLES: |
 
   # Use arbitrary epoch value
   {{ '%Y-%m-%d' | strftime(0) }}          # => 1970-01-01
-  {{ '%Y-%m-%d' | strftime(1441357287) }} # => 2015-09-04
-
-  # complex examples
-  vars:
-    date1: '2022-11-15T03:23:13.686956868Z'
-    date2: '2021-12-15T16:06:24.400087Z'
-    date_short: '{{ date1|regex_replace("([^.]+)(\.\d{6})(\d*)(.+)", "\1\2\4") }}' #shorten microseconds
-    iso8601format: '%Y-%m-%dT%H:%M:%S.%fZ'
-    date_diff_isoed: '{{ (date1|to_datetime(isoformat) - date2|to_datetime(isoformat)).total_seconds() }}'
+  {{ '%Y-%m-%d' | strftime(seconds=1441357287, utc=true) }} # => 2015-09-04
 
 RETURN:
   _value:

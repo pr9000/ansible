@@ -1,4 +1,5 @@
 """Timeout management for tests."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -19,6 +20,7 @@ from .config import (
 )
 
 from .util import (
+    cache,
     display,
     TimeoutExpiredError,
 )
@@ -80,6 +82,7 @@ class TimeoutDetail:
         )
 
 
+@cache
 def get_timeout() -> TimeoutDetail | None:
     """Return details about the currently set timeout, if any, otherwise return None."""
     try:
@@ -118,13 +121,13 @@ def configure_test_timeout(args: TestConfig) -> None:
 
         raise TimeoutExpiredError(f'Tests aborted after exceeding the {timeout.duration} minute time limit.')
 
-    def timeout_waiter(timeout_seconds: int) -> None:
+    def timeout_waiter(timeout_seconds: float) -> None:
         """Background thread which will kill the current process if the timeout elapses."""
         time.sleep(timeout_seconds)
         os.kill(os.getpid(), signal.SIGUSR1)
 
     signal.signal(signal.SIGUSR1, timeout_handler)
 
-    instance = WrappedThread(functools.partial(timeout_waiter, timeout_remaining.total_seconds()))
+    instance = WrappedThread(functools.partial(timeout_waiter, timeout_remaining.total_seconds()), 'Timeout Watchdog')
     instance.daemon = True
     instance.start()

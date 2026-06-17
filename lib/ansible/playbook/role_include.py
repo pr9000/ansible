@@ -14,21 +14,16 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
-
-from os.path import basename
+from __future__ import annotations
 
 import ansible.constants as C
-from ansible.errors import AnsibleParserError
+from ansible.errors import AnsibleError, AnsibleParserError
 from ansible.playbook.attribute import NonInheritableFieldAttribute
 from ansible.playbook.task_include import TaskInclude
 from ansible.playbook.role import Role
 from ansible.playbook.role.include import RoleInclude
 from ansible.utils.display import Display
-from ansible.module_utils.six import string_types
-from ansible.template import Templar
+from ansible._internal._templating._engine import TemplateEngine
 
 __all__ = ['IncludeRole']
 
@@ -44,16 +39,17 @@ class IncludeRole(TaskInclude):
 
     BASE = frozenset(('name', 'role'))  # directly assigned
     FROM_ARGS = frozenset(('tasks_from', 'vars_from', 'defaults_from', 'handlers_from'))  # used to populate from dict in role
-    OTHER_ARGS = frozenset(('apply', 'public', 'allow_duplicates', 'rolespec_validate'))  # assigned to matching property
+    OTHER_ARGS = frozenset(('apply', 'public', 'allow_duplicates', 'rolespec_validate', 'rescuable'))  # assigned to matching property
     VALID_ARGS = BASE | FROM_ARGS | OTHER_ARGS  # all valid args
 
     # =================================================================================
     # ATTRIBUTES
+    public = NonInheritableFieldAttribute(isa='bool', default=None, private=False, always_post_validate=True)
 
     # private as this is a 'module options' vs a task property
     allow_duplicates = NonInheritableFieldAttribute(isa='bool', default=True, private=True, always_post_validate=True)
-    public = NonInheritableFieldAttribute(isa='bool', default=False, private=True, always_post_validate=True)
     rolespec_validate = NonInheritableFieldAttribute(isa='bool', default=True, private=True, always_post_validate=True)
+    rescuable = NonInheritableFieldAttribute(isa='bool', default=True, private=True, always_post_validate=True)
 
     def __init__(self, block=None, role=None, task_include=None):
 
@@ -65,7 +61,7 @@ class IncludeRole(TaskInclude):
         self._role_path = None
 
     def get_name(self):
-        ''' return the name of the task '''
+        """ return the name of the task """
         return self.name or "%s : %s" % (self.action, self._role_name)
 
     def get_block_list(self, play=None, variable_manager=None, loader=None):
@@ -76,23 +72,29 @@ class IncludeRole(TaskInclude):
         else:
             myplay = play
 
-        ri = RoleInclude.load(self._role_name, play=myplay, variable_manager=variable_manager, loader=loader, collection_list=self.collections)
+        try:
+            ri = RoleInclude.load(self._role_name, play=myplay, variable_manager=variable_manager, loader=loader, collection_list=self.collections)
+        except AnsibleError as e:
+            if not self.rescuable:
+                raise AnsibleParserError("Could not include role.") from e
+            raise
+
         ri.vars |= self.vars
 
         if variable_manager is not None:
             available_variables = variable_manager.get_vars(play=myplay, task=self)
         else:
             available_variables = {}
-        templar = Templar(loader=loader, variables=available_variables)
+        templar = TemplateEngine(loader=loader, variables=available_variables)
         from_files = templar.template(self._from_files)
 
         # build role
-        actual_role = Role.load(ri, myplay, parent_role=self._parent_role, from_files=from_files,
-                                from_include=True, validate=self.rolespec_validate, public=self.public)
+        actual_role = Role.load(ri, myplay, parent_role=self._parent_role, from_files=from_files, from_include=True,
+                                validate=self.rolespec_validate, public=self.public, static=self.statically_loaded, rescuable=self.rescuable)
         actual_role._metadata.allow_duplicates = self.allow_duplicates
 
-        if self.statically_loaded or self.public:
-            myplay.roles.append(actual_role)
+        # add role to play
+        myplay.roles.append(actual_role)
 
         # save this for later use
         self._role_path = actual_role._role_path
@@ -113,7 +115,7 @@ class IncludeRole(TaskInclude):
             b.collections = actual_role.collections
 
         # updated available handlers in play
-        handlers = actual_role.get_handler_blocks(play=myplay)
+        handlers = actual_role.get_handler_blocks(play=myplay, dep_chain=dep_chain)
         for h in handlers:
             h._parent = p_block
         myplay.handlers = myplay.handlers + handlers
@@ -124,10 +126,6 @@ class IncludeRole(TaskInclude):
 
         ir = IncludeRole(block, role, task_include=task_include).load_data(data, variable_manager=variable_manager, loader=loader)
 
-        # dyanmic role!
-        if ir.action in C._ACTION_INCLUDE_ROLE:
-            ir.static = False
-
         # Validate options
         my_arg_names = frozenset(ir.args.keys())
 
@@ -135,10 +133,6 @@ class IncludeRole(TaskInclude):
         ir._role_name = ir.args.get('name', ir.args.get('role'))
         if ir._role_name is None:
             raise AnsibleParserError("'name' is a required field for %s." % ir.action, obj=data)
-
-        # public is only valid argument for includes, imports are always 'public' (after they run)
-        if 'public' in ir.args and ir.action not in C._ACTION_INCLUDE_ROLE:
-            raise AnsibleParserError('Invalid options for %s: public' % ir.action, obj=data)
 
         # validate bad args, otherwise we silently ignore
         bad_opts = my_arg_names.difference(IncludeRole.VALID_ARGS)
@@ -149,16 +143,20 @@ class IncludeRole(TaskInclude):
         for key in my_arg_names.intersection(IncludeRole.FROM_ARGS):
             from_key = key.removesuffix('_from')
             args_value = ir.args.get(key)
-            if not isinstance(args_value, string_types):
+            if not isinstance(args_value, str):
                 raise AnsibleParserError('Expected a string for %s but got %s instead' % (key, type(args_value)))
-            ir._from_files[from_key] = basename(args_value)
+            ir._from_files[from_key] = args_value
 
-        # apply is only valid for includes, not imports as they inherit directly
+        # apply and rescuable are only valid for includes, not imports as they inherit directly
         apply_attrs = ir.args.get('apply', {})
         if apply_attrs and ir.action not in C._ACTION_INCLUDE_ROLE:
             raise AnsibleParserError('Invalid options for %s: apply' % ir.action, obj=data)
         elif not isinstance(apply_attrs, dict):
             raise AnsibleParserError('Expected a dict for apply but got %s instead' % type(apply_attrs), obj=data)
+
+        resc_attr = ir.args.get('rescuable', None)
+        if resc_attr and ir.action not in C._ACTION_INCLUDE_ROLE:
+            raise AnsibleParserError(f'Invalid options for {ir.action}: rescuable', obj=data)
 
         # manual list as otherwise the options would set other task parameters we don't want.
         for option in my_arg_names.intersection(IncludeRole.OTHER_ARGS):

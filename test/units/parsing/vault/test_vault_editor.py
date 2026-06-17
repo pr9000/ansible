@@ -16,9 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import os
 import tempfile
@@ -26,7 +24,7 @@ from io import BytesIO, StringIO
 
 import pytest
 
-from units.compat import unittest
+import unittest
 from unittest.mock import patch
 
 from ansible import errors
@@ -167,7 +165,7 @@ class TestVaultEditor(unittest.TestCase):
 
         tmp_path = editor_args[-1]
 
-        # simulate the tmp file being editted
+        # simulate the tmp file being edited
         with open(tmp_path, 'wb') as tmp_file:
             tmp_file.write(new_src_contents)
 
@@ -257,7 +255,7 @@ class TestVaultEditor(unittest.TestCase):
 
         new_password = 'password2:electricbugaloo'
         self.assertRaisesRegex(errors.AnsibleError,
-                               'input is not vault encrypted data',
+                               'Input is not vault encrypted data',
                                ve.rekey_file,
                                src_file_path, new_password)
 
@@ -281,7 +279,7 @@ class TestVaultEditor(unittest.TestCase):
 
         ve = self._vault_editor()
         self.assertRaisesRegex(errors.AnsibleError,
-                               'input is not vault encrypted data',
+                               'Input is not vault encrypted data',
                                ve.plaintext,
                                src_file_path)
 
@@ -401,7 +399,7 @@ class TestVaultEditor(unittest.TestCase):
         self.assertEqual(src_file_plaintext, new_src_contents)
 
         # self.assertEqual(src_file_plaintext, new_src_contents,
-        #                 'The decrypted plaintext of the editted file is not the expected contents.')
+        #                 'The decrypted plaintext of the edited file is not the expected contents.')
 
     @patch('ansible.parsing.vault.subprocess.call')
     def test_edit_file_not_encrypted(self, mock_sp_call):
@@ -412,7 +410,7 @@ class TestVaultEditor(unittest.TestCase):
 
         ve = self._vault_editor()
         self.assertRaisesRegex(errors.AnsibleError,
-                               'input is not vault encrypted data',
+                               'Input is not vault encrypted data',
                                ve.edit_file,
                                src_file_path)
 
@@ -435,7 +433,7 @@ class TestVaultEditor(unittest.TestCase):
 
         ve = self._vault_editor()
         self.assertRaisesRegex(errors.AnsibleError,
-                               'input is not vault encrypted data',
+                               'Input is not vault encrypted data',
                                ve.decrypt_file,
                                src_file_path)
 

@@ -2,8 +2,7 @@
 # Copyright (c) 2020 Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-from __future__ import absolute_import, division, print_function
-__metaclass__ = type
+from __future__ import annotations
 
 import pathlib
 
@@ -12,11 +11,12 @@ import pytest
 from ansible import constants as C
 from ansible import context
 from ansible.cli.galaxy import GalaxyCLI
-from ansible.errors import AnsibleError, AnsibleOptionsError
+from ansible.errors import AnsibleError
 from ansible.galaxy import collection
 from ansible.galaxy.dependency_resolution.dataclasses import Requirement
 from ansible.module_utils.common.text.converters import to_native
-from ansible.plugins.loader import init_plugin_loader
+
+pytestmark = pytest.mark.usefixtures("collection_loader")
 
 
 def isdir(path):
@@ -90,7 +90,6 @@ def test_execute_list_collection_all(mocker, capsys, mock_from_path, tmp_path_fa
     """Test listing all collections from multiple paths"""
 
     cliargs()
-    init_plugin_loader()
 
     mocker.patch('os.path.exists', return_value=True)
     gc = GalaxyCLI(['ansible-galaxy', 'collection', 'list'])
@@ -122,7 +121,6 @@ def test_execute_list_collection_specific(mocker, capsys, mock_from_path, tmp_pa
     collection_name = 'sandwiches.ham'
 
     cliargs(collection_name=collection_name)
-    init_plugin_loader()
 
     mocker.patch('ansible.galaxy.collection.validate_collection_name', collection_name)
     mocker.patch('ansible.cli.galaxy._get_collection_widths', return_value=(14, 5))
@@ -149,7 +147,6 @@ def test_execute_list_collection_specific_duplicate(mocker, capsys, mock_from_pa
     collection_name = 'sandwiches.pbj'
 
     cliargs(collection_name=collection_name)
-    init_plugin_loader()
 
     mocker.patch('ansible.galaxy.collection.validate_collection_name', collection_name)
 
@@ -177,8 +174,6 @@ def test_execute_list_collection_specific_duplicate(mocker, capsys, mock_from_pa
 def test_execute_list_collection_specific_invalid_fqcn(mocker, tmp_path_factory):
     """Test an invalid fully qualified collection name (FQCN)"""
 
-    init_plugin_loader()
-
     collection_name = 'no.good.name'
 
     cliargs(collection_name=collection_name)
@@ -196,7 +191,6 @@ def test_execute_list_collection_no_valid_paths(mocker, capsys, tmp_path_factory
     """Test listing collections when no valid paths are given"""
 
     cliargs()
-    init_plugin_loader()
 
     mocker.patch('os.path.exists', return_value=True)
     mocker.patch('os.path.isdir', return_value=False)
@@ -207,20 +201,19 @@ def test_execute_list_collection_no_valid_paths(mocker, capsys, tmp_path_factory
     tmp_path = tmp_path_factory.mktemp('test-ÅÑŚÌβŁÈ Collections')
     concrete_artifact_cm = collection.concrete_artifact_manager.ConcreteArtifactsManager(tmp_path, validate_certs=False)
 
-    with pytest.raises(AnsibleOptionsError, match=r'None of the provided paths were usable.'):
-        gc.execute_list_collection(artifacts_manager=concrete_artifact_cm)
+    gc.execute_list_collection(artifacts_manager=concrete_artifact_cm)
 
     out, err = capsys.readouterr()
 
     assert '[WARNING]: - the configured path' in err
-    assert 'exists, but it\nis not a directory.' in err
+    assert '[WARNING]: None of the provided paths were usable' in err
+    assert 'exists, but it is not a directory.' in err
 
 
 def test_execute_list_collection_one_invalid_path(mocker, capsys, mock_from_path, tmp_path_factory):
     """Test listing all collections when one invalid path is given"""
 
     cliargs(collections_paths=['nope'])
-    init_plugin_loader()
 
     mocker.patch('os.path.exists', return_value=True)
     mocker.patch('os.path.isdir', isdir)

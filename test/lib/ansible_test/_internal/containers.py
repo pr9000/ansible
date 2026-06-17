@@ -1,4 +1,5 @@
 """High level functions for working with containers."""
+
 from __future__ import annotations
 
 import collections.abc as c
@@ -114,6 +115,7 @@ def run_support_container(
     env: t.Optional[dict[str, str]] = None,
     options: t.Optional[list[str]] = None,
     publish_ports: bool = True,
+    data_container: bool = False,
 ) -> t.Optional[ContainerDescriptor]:
     """
     Start a container used to support tests, but not run them.
@@ -177,6 +179,7 @@ def run_support_container(
         running,
         cleanup,
         env,
+        data_container,
     )
 
     with support_containers_mutex:
@@ -292,10 +295,13 @@ def get_docker_preferred_network_name(args: EnvironmentConfig) -> t.Optional[str
         current_container_id = get_docker_container_id()
 
         if current_container_id:
-            # Make sure any additional containers we launch use the same network as the current container we're running in.
-            # This is needed when ansible-test is running in a container that is not connected to Docker's default network.
-            container = docker_inspect(args, current_container_id, always=True)
-            network = container.get_network_name()
+            try:
+                # Make sure any additional containers we launch use the same network as the current container we're running in.
+                # This is needed when ansible-test is running in a container that is not connected to Docker's default network.
+                container = docker_inspect(args, current_container_id, always=True)
+                network = container.get_network_name()
+            except ContainerNotFoundError:
+                display.warning('Unable to detect the network for the current container. Use the `--docker-network` option if containers are unreachable.')
 
     # The default docker behavior puts containers on the same network.
     # The default podman behavior puts containers on isolated networks which don't allow communication between containers or network disconnect.
@@ -362,7 +368,7 @@ class ContainerAccess:
         if self.forwards:
             ports = list(self.forwards.items())
         else:
-            ports = [(port, port) for port in self.ports]
+            ports = [(port, port) for port in self.ports or []]
 
         return ports
 
@@ -447,6 +453,9 @@ def create_container_database(args: EnvironmentConfig) -> ContainerDatabase:
     managed: dict[str, dict[str, ContainerAccess]] = {}
 
     for name, container in support_containers.items():
+        if container.data_container:
+            # data containers will not be started, and will be missing details
+            continue
         if container.details.published_ports:
             if require_docker().command == 'podman':
                 host_ip_func = get_podman_host_ip
@@ -655,6 +664,7 @@ class ContainerDescriptor:
         running: bool,
         cleanup: bool,
         env: t.Optional[dict[str, str]],
+        data_container: bool,
     ) -> None:
         self.image = image
         self.context = context
@@ -667,6 +677,7 @@ class ContainerDescriptor:
         self.cleanup = cleanup
         self.env = env
         self.details: t.Optional[SupportContainer] = None
+        self.data_container = data_container
 
     def start(self, args: EnvironmentConfig) -> None:
         """Start the container. Used for containers which are created, but not started."""

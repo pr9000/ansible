@@ -14,8 +14,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 from ansible import constants as C
 from ansible.plugins.action import ActionBase
@@ -33,7 +32,7 @@ class ActionModule(ActionBase):
         result = super(ActionModule, self).run(tmp, task_vars)
         del tmp  # tmp no longer has any effect
 
-        wrap_async = self._task.async_val and not self._connection.has_native_async
+        wrap_async = self._task.async_val
 
         # do work!
         result = merge_hash(result, self._execute_module(task_vars=task_vars, wrap_async=wrap_async))

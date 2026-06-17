@@ -3,11 +3,10 @@
 # Copyright: Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-from __future__ import absolute_import, division, print_function
-__metaclass__ = type
+from __future__ import annotations
 
 
-DOCUMENTATION = r'''
+DOCUMENTATION = r"""
 ---
 author: Ansible Core Team (@ansible)
 module: include_role
@@ -72,6 +71,12 @@ options:
     type: bool
     default: yes
     version_added: '2.11'
+  rescuable:
+    description:
+      - This toggle allows for errors from the include itself to either be a task failure, which is 'rescuable', or fatal syntax errors.
+    type: bool
+    default: yes
+    version_added: '2.21'
 extends_documentation_fragment:
     - action_common_attributes
     - action_common_attributes.conn
@@ -84,6 +89,8 @@ attributes:
     diff_mode:
         support: none
 notes:
+  - Beginning in ansible 2.21 we have normalized how error types from the include itself are emitted.
+    Using the O(rescuable) option, you can control if it is a task failure or a syntax error.
   - Handlers and are made available to the whole play.
   - After Ansible 2.4, you can use M(ansible.builtin.import_role) for B(static) behaviour and this action for B(dynamic) one.
 seealso:
@@ -91,11 +98,11 @@ seealso:
 - module: ansible.builtin.import_role
 - module: ansible.builtin.import_tasks
 - module: ansible.builtin.include_tasks
-- ref: playbooks_reuse_includes
+- ref: playbooks_reuse
   description: More information related to including and importing playbooks, roles and tasks.
-'''
+"""
 
-EXAMPLES = r'''
+EXAMPLES = r"""
 - ansible.builtin.include_role:
     name: myrole
 
@@ -132,8 +139,8 @@ EXAMPLES = r'''
         - install
   tags:
     - always
-'''
+"""
 
-RETURN = r'''
+RETURN = r"""
 # This module does not return anything except tasks to execute.
-'''
+"""

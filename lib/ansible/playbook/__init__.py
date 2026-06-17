@@ -15,9 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import os
 
@@ -68,7 +66,7 @@ class Playbook:
         self._file_name = file_name
 
         try:
-            ds = self._loader.load_from_file(os.path.basename(file_name))
+            ds = self._loader.load_from_file(os.path.basename(file_name), trusted_as_template=True)
         except UnicodeDecodeError as e:
             raise AnsibleParserError("Could not read playbook (%s) due to encoding issues: %s" % (file_name, to_native(e)))
 

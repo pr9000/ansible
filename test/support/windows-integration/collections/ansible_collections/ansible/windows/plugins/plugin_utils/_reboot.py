@@ -13,6 +13,7 @@ interface is not final and count be subject to change.
 # and may not remain stable to outside uses. Changes may be made in ANY release, even a bugfix release.
 # See also: https://github.com/ansible/community/issues/539#issuecomment-780839686
 # Please open an issue if you have questions about this.
+from __future__ import annotations
 
 import datetime
 import json
@@ -514,7 +515,7 @@ def _perform_reboot(
 
     # Test for "A system shutdown has already been scheduled. (1190)" and handle it gracefully
     if handle_abort and (rc == 1190 or (rc != 0 and stderr and "(1190)" in stderr)):
-        display.warning("A scheduled reboot was pre-empted by Ansible.")
+        display.warning("A scheduled reboot was preempted by Ansible.")
 
         # Try to abort (this may fail if it was already aborted)
         rc, stdout, stderr = _execute_command(

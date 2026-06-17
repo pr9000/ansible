@@ -5,11 +5,10 @@
 
 # This is a virtual module that is entirely implemented as an action plugin and runs on the controller
 
-from __future__ import absolute_import, division, print_function
-__metaclass__ = type
+from __future__ import annotations
 
 
-DOCUMENTATION = r'''
+DOCUMENTATION = r"""
 ---
 module: fetch
 short_description: Fetch files from remote nodes
@@ -29,8 +28,8 @@ options:
   dest:
     description:
     - A directory to save the file into.
-    - For example, if the O(dest) directory is C(/backup) a O(src) file named C(/etc/profile) on host
-      C(host.example.com), would be saved into C(/backup/host.example.com/etc/profile).
+    - For example, if O(dest=/backup), then O(src=/etc/profile) on host
+      C(host.example.com), would save the file into C(/backup/host.example.com/etc/profile).
       The host name is based on the inventory name.
     required: yes
   fail_on_missing:
@@ -87,7 +86,7 @@ notes:
 - Prior to Ansible 2.5 this module would not fail if reading the remote
   file was impossible unless O(fail_on_missing) was set.
 - In Ansible 2.5 or later, playbook authors are encouraged to use
-  C(fail_when) or C(ignore_errors) to get this ability. They may
+  C(failed_when) or C(ignore_errors) to get this ability. They may
   also explicitly set O(fail_on_missing) to V(false) to get the
   non-failing behaviour.
 seealso:
@@ -96,9 +95,9 @@ seealso:
 author:
 - Ansible Core Team
 - Michael DeHaan
-'''
+"""
 
-EXAMPLES = r'''
+EXAMPLES = r"""
 - name: Store file into /tmp/fetched/host.example.com/tmp/somefile
   ansible.builtin.fetch:
     src: /tmp/somefile
@@ -121,4 +120,4 @@ EXAMPLES = r'''
     src: /tmp/uniquefile
     dest: special/prefix-{{ inventory_hostname }}
     flat: yes
-'''
+"""

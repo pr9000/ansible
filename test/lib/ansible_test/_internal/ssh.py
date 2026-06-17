@@ -1,4 +1,5 @@
 """High level functions for working with SSH."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -12,7 +13,6 @@ import shlex
 import typing as t
 
 from .encoding import (
-    to_bytes,
     to_text,
 )
 
@@ -39,6 +39,7 @@ class SshConnectionDetail:
     user: str
     identity_file: str
     python_interpreter: t.Optional[str] = None
+    powershell_interpreter: str | None = None
     shell_type: t.Optional[str] = None
     enable_rsa_sha1: bool = False
 
@@ -222,13 +223,10 @@ def run_ssh_command(
     cmd_show = shlex.join(cmd)
     display.info('Run background command: %s' % cmd_show, verbosity=1, truncate=True)
 
-    cmd_bytes = [to_bytes(arg) for arg in cmd]
-    env_bytes = dict((to_bytes(k), to_bytes(v)) for k, v in env.items())
-
     if args.explain:
         process = SshProcess(None)
     else:
-        process = SshProcess(subprocess.Popen(cmd_bytes, env=env_bytes, bufsize=-1,  # pylint: disable=consider-using-with
+        process = SshProcess(subprocess.Popen(cmd, env=env, bufsize=-1,  # pylint: disable=consider-using-with
                                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
 
     return process
@@ -245,6 +243,7 @@ def create_ssh_port_forwards(
     """
     options: dict[str, t.Union[str, int]] = dict(
         LogLevel='INFO',  # info level required to get messages on stderr indicating the ports assigned to each forward
+        ControlPath='none',  # if the user has ControlPath set up for every host, it will prevent creation of forwards
     )
 
     cli_args = []
@@ -287,6 +286,7 @@ def generate_ssh_inventory(ssh_connections: list[SshConnectionDetail]) -> str:
                 ansible_connection='ssh',
                 ansible_pipelining='yes',
                 ansible_python_interpreter=ssh.python_interpreter,
+                ansible_pwsh_interpreter=ssh.powershell_interpreter,
                 ansible_shell_type=ssh.shell_type,
                 ansible_ssh_extra_args=ssh_options_to_str(dict(UserKnownHostsFile='/dev/null', **ssh.options)),  # avoid changing the test environment
                 ansible_ssh_host_key_checking='no',

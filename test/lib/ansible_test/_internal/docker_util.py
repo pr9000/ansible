@@ -1,4 +1,5 @@
 """Functions for accessing docker via the docker cli."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -20,6 +21,8 @@ from .util import (
     SubprocessError,
     cache,
     OutputStream,
+    InternalError,
+    format_command_output,
 )
 
 from .util_common import (
@@ -47,7 +50,7 @@ DOCKER_COMMANDS = [
     'podman',
 ]
 
-UTILITY_IMAGE = 'quay.io/ansible/ansible-test-utility-container:2.0.0'
+UTILITY_IMAGE = 'quay.io/ansible/ansible-test-utility-container:3.5.0'
 
 # Max number of open files in a docker container.
 # Passed with --ulimit option to the docker run command.
@@ -300,7 +303,7 @@ def detect_host_properties(args: CommonConfig) -> ContainerHostProperties:
     options = ['--volume', '/sys/fs/cgroup:/probe:ro']
     cmd = ['sh', '-c', ' && echo "-" && '.join(multi_line_commands)]
 
-    stdout = run_utility_container(args, 'ansible-test-probe', cmd, options)[0]
+    stdout, stderr = run_utility_container(args, 'ansible-test-probe', cmd, options)
 
     if args.explain:
         return ContainerHostProperties(
@@ -312,6 +315,12 @@ def detect_host_properties(args: CommonConfig) -> ContainerHostProperties:
         )
 
     blocks = stdout.split('\n-\n')
+
+    if len(blocks) != len(multi_line_commands):
+        message = f'Unexpected probe output. Expected {len(multi_line_commands)} blocks but found {len(blocks)}.\n'
+        message += format_command_output(stdout, stderr)
+
+        raise InternalError(message.strip())
 
     values = blocks[0].split('\n')
 
@@ -496,9 +505,9 @@ def get_docker_hostname() -> str:
     """Return the hostname of the Docker service."""
     docker_host = os.environ.get('DOCKER_HOST')
 
-    if docker_host and docker_host.startswith('tcp://'):
+    if docker_host and docker_host.startswith(('tcp://', 'ssh://')):
         try:
-            hostname = urllib.parse.urlparse(docker_host)[1].split(':')[0]
+            hostname = urllib.parse.urlparse(docker_host).hostname
             display.info('Detected Docker host: %s' % hostname, verbosity=1)
         except ValueError:
             hostname = 'localhost'
@@ -507,7 +516,7 @@ def get_docker_hostname() -> str:
         hostname = 'localhost'
         display.info('Assuming Docker is available on localhost.', verbosity=1)
 
-    return hostname
+    return hostname or 'localhost'
 
 
 @cache
@@ -649,15 +658,15 @@ def __docker_pull(args: CommonConfig, image: str) -> None:
     """Internal implementation for docker_pull. Do not call directly."""
     if '@' not in image and ':' not in image:
         display.info('Skipping pull of image without tag or digest: %s' % image, verbosity=2)
-        inspect = docker_image_inspect(args, image)
-    elif inspect := docker_image_inspect(args, image, always=True):
+        docker_image_inspect(args, image)
+    elif docker_image_inspect(args, image, always=True):
         display.info('Skipping pull of existing image: %s' % image, verbosity=2)
     else:
         for _iteration in range(1, 10):
             try:
                 docker_command(args, ['pull', image], capture=False)
 
-                if (inspect := docker_image_inspect(args, image)) or args.explain:
+                if docker_image_inspect(args, image) or args.explain:
                     break
 
                 display.warning(f'Image "{image}" not found after pull completed. Waiting a few seconds before trying again.')
@@ -667,16 +676,15 @@ def __docker_pull(args: CommonConfig, image: str) -> None:
         else:
             raise ApplicationError(f'Failed to pull container image "{image}".')
 
-    if inspect and inspect.volumes:
-        display.warning(f'Image "{image}" contains {len(inspect.volumes)} volume(s): {", ".join(sorted(inspect.volumes))}\n'
-                        'This may result in leaking anonymous volumes. It may also prevent the image from working on some hosts or container engines.\n'
-                        'The image should be rebuilt without the use of the VOLUME instruction.',
-                        unique=True)
-
 
 def docker_cp_to(args: CommonConfig, container_id: str, src: str, dst: str) -> None:
     """Copy a file to the specified container."""
     docker_command(args, ['cp', src, '%s:%s' % (container_id, dst)], capture=True)
+
+
+def docker_cp_from(args: CommonConfig, container_id: str, src: str, dst: str) -> None:
+    """Copy a file from the specified container."""
+    docker_command(args, ['cp', '%s:%s' % (container_id, src), dst], capture=True)
 
 
 def docker_create(
@@ -713,10 +721,11 @@ def docker_rm(args: CommonConfig, container_id: str) -> None:
     """Remove the specified container."""
     try:
         # Stop the container with SIGKILL immediately, then remove the container.
-        # Podman supports the `--time` option on `rm`, but only since version 4.0.0.
-        # Docker does not support the `--time` option on `rm`.
-        docker_command(args, ['stop', '--time', '0', container_id], capture=True)
-        docker_command(args, ['rm', container_id], capture=True)
+        # Docker supports `--timeout` for stop. The `--time` option was deprecated in v28.0.
+        # Podman supports `--time` for stop. The `--timeout` option was deprecated in 1.9.0.
+        # Both Docker and Podman support the `-t` option for stop.
+        docker_command(args, ['stop', '-t', '0', container_id], capture=True)
+        docker_command(args, ['rm', '-v', container_id], capture=True)
     except SubprocessError as ex:
         # Both Podman and Docker report an error if the container does not exist.
         # The error messages contain the same "no such container" string, differing only in capitalization.

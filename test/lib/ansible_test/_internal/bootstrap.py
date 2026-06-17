@@ -1,4 +1,5 @@
 """Bootstrapping for test hosts."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -23,13 +24,14 @@ from .core_ci import (
 )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class Bootstrap:
     """Base class for bootstrapping systems."""
 
     controller: bool
-    python_versions: list[str]
+    python_interpreters: dict[str, str]
     ssh_key: SshKey
+    powershell_versions: list[str]
 
     @property
     def bootstrap_type(self) -> str:
@@ -41,10 +43,11 @@ class Bootstrap:
         return dict(
             bootstrap_type=self.bootstrap_type,
             controller='yes' if self.controller else '',
-            python_versions=self.python_versions,
+            python_interpreters=[f'{key}:{value}' for key, value in self.python_interpreters.items()],
             ssh_key_type=self.ssh_key.KEY_TYPE,
             ssh_private_key=self.ssh_key.key_contents,
             ssh_public_key=self.ssh_key.pub_contents,
+            powershell_versions=self.powershell_versions,
         )
 
     def get_script(self) -> str:
@@ -63,7 +66,7 @@ class Bootstrap:
         return script
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class BootstrapDocker(Bootstrap):
     """Bootstrap docker instances."""
 
@@ -79,7 +82,7 @@ class BootstrapDocker(Bootstrap):
         return variables
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class BootstrapRemote(Bootstrap):
     """Bootstrap remote instances."""
 

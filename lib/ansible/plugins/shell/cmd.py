@@ -1,17 +1,16 @@
 # Copyright (c) 2019 Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-DOCUMENTATION = '''
+DOCUMENTATION = """
 name: cmd
 version_added: '2.8'
 short_description: Windows Command Prompt
 description:
-- Used with the 'ssh' connection plugin and no C(DefaultShell) has been set on the Windows host.
+- Used with the 'winrm' connection or 'ssh' with no C(DefaultShell) set on the Windows host.
 extends_documentation_fragment:
 - shell_windows
-'''
+"""
 
 import re
 
@@ -34,7 +33,22 @@ class ShellModule(PSShellModule):
     # Used by various parts of Ansible to do Windows specific changes
     _IS_WINDOWS = True
 
-    def quote(self, cmd):
+    def join(self, cmd_parts: list[str]) -> str:
+        if not cmd_parts:
+            return ""
+
+        cmd = self._quote_argument(cmd_parts[0], for_first_argument=True)
+        args = []
+        if len(cmd_parts) > 1:
+            args = [self.quote(a) for a in cmd_parts[1:]]
+
+        args.insert(0, cmd)
+        return " ".join(args)
+
+    def quote(self, cmd: str) -> str:
+        return self._quote_argument(cmd, for_first_argument=False)
+
+    def _quote_argument(self, cmd: str, for_first_argument: bool = False) -> str:
         # cmd does not support single quotes that the shlex_quote uses. We need to override the quoting behaviour to
         # better match cmd.exe.
         # https://blogs.msdn.microsoft.com/twistylittlepassagesallalike/2011/04/23/everyone-quotes-command-line-arguments-the-wrong-way/
@@ -54,4 +68,4 @@ class ShellModule(PSShellModule):
                 # I can't find any docs that explicitly say this but to escape ", it needs to be prefixed with \^.
                 cmd = cmd.replace(c, ("\\^" if c == '"' else "^") + c)
 
-        return '^"' + cmd + '^"'
+        return f'"{cmd}"' if for_first_argument else f'^"{cmd}^"'

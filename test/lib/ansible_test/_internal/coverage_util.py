@@ -1,15 +1,15 @@
 """Utility code for facilitating collection of code coverage when running tests."""
+
 from __future__ import annotations
 
 import dataclasses
 import os
 import sqlite3
 import tempfile
+import textwrap
 import typing as t
 
 from .config import (
-    IntegrationConfig,
-    SanityConfig,
     TestConfig,
 )
 
@@ -69,8 +69,8 @@ class CoverageVersion:
 
 COVERAGE_VERSIONS = (
     # IMPORTANT: Keep this in sync with the ansible-test.txt requirements file.
-    CoverageVersion('6.5.0', 7, (3, 7), (3, 12)),
-    CoverageVersion('4.5.4', 0, (2, 6), (3, 6)),
+    CoverageVersion('7.13.5', 7, (3, 10), (3, 15)),
+    CoverageVersion('7.10.7', 7, (3, 9), (3, 9)),
 )
 """
 This tuple specifies the coverage version to use for Python version ranges.
@@ -217,7 +217,7 @@ def get_coverage_config(args: TestConfig) -> str:
     except AttributeError:
         pass
 
-    coverage_config = generate_coverage_config(args)
+    coverage_config = generate_coverage_config()
 
     if args.explain:
         temp_dir = '/tmp/coverage-temp-dir'
@@ -235,10 +235,10 @@ def get_coverage_config(args: TestConfig) -> str:
     return path
 
 
-def generate_coverage_config(args: TestConfig) -> str:
+def generate_coverage_config() -> str:
     """Generate code coverage configuration for tests."""
     if data_context().content.collection:
-        coverage_config = generate_collection_coverage_config(args)
+        coverage_config = generate_collection_coverage_config()
     else:
         coverage_config = generate_ansible_coverage_config()
 
@@ -247,10 +247,13 @@ def generate_coverage_config(args: TestConfig) -> str:
 
 def generate_ansible_coverage_config() -> str:
     """Generate code coverage configuration for Ansible tests."""
-    coverage_config = '''
+    coverage_config = """
 [run]
+core = ctrace
 branch = True
-concurrency = multiprocessing
+concurrency =
+    multiprocessing
+    thread
 parallel = True
 
 omit =
@@ -260,43 +263,50 @@ omit =
     */pyshared/*
     */pytest
     */AnsiballZ_*.py
-    */test/results/*
-'''
+    */test/results/.tmp/delegation/*
+"""
+
+    coverage_config = coverage_config.lstrip()
 
     return coverage_config
 
 
-def generate_collection_coverage_config(args: TestConfig) -> str:
+def generate_collection_coverage_config() -> str:
     """Generate code coverage configuration for Ansible Collection tests."""
-    coverage_config = '''
+    include_patterns = [
+        # {base}/ansible_collections/{ns}/{col}/*
+        os.path.join(data_context().content.root, '*'),
+        # */ansible_collections/{ns}/{col}/* (required to pick up AnsiballZ coverage)
+        os.path.join('*', data_context().content.collection.directory, '*'),
+    ]
+
+    omit_patterns = [
+        # {base}/ansible_collections/{ns}/{col}/tests/output/.tmp/delegation/*
+        os.path.join(data_context().content.root, data_context().content.results_path, '.tmp/delegation/*'),
+    ]
+
+    include = textwrap.indent('\n'.join(include_patterns), ' ' * 4)
+    omit = textwrap.indent('\n'.join(omit_patterns), ' ' * 4)
+
+    coverage_config = f"""
 [run]
+core = ctrace
 branch = True
-concurrency = multiprocessing
+concurrency =
+    multiprocessing
+    thread
 parallel = True
 disable_warnings =
     no-data-collected
-'''
 
-    if isinstance(args, IntegrationConfig):
-        coverage_config += '''
 include =
-    %s/*
-    */%s/*
-''' % (data_context().content.root, data_context().content.collection.directory)
-    elif isinstance(args, SanityConfig):
-        # temporary work-around for import sanity test
-        coverage_config += '''
-include =
-    %s/*
+{include}
 
 omit =
-    %s/*
-''' % (data_context().content.root, os.path.join(data_context().content.root, data_context().content.results_path))
-    else:
-        coverage_config += '''
-include =
-     %s/*
-''' % data_context().content.root
+{omit}
+"""
+
+    coverage_config = coverage_config.lstrip()
 
     return coverage_config
 

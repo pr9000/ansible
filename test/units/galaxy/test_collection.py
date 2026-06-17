@@ -2,9 +2,7 @@
 # Copyright: (c) 2019, Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import json
 import os
@@ -20,29 +18,37 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import ansible.constants as C
 from ansible import context
-from ansible.cli import galaxy
 from ansible.cli.galaxy import GalaxyCLI
+from ansible.config import manager
 from ansible.errors import AnsibleError
 from ansible.galaxy import api, collection, token
+from ansible.module_utils.common.sentinel import Sentinel
 from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
-from ansible.module_utils.six.moves import builtins
+from ansible.module_utils.common.file import S_IRWU_RG_RO
+import builtins
 from ansible.utils import context_objects as co
 from ansible.utils.display import Display
 from ansible.utils.hashing import secure_hash_s
-from ansible.utils.sentinel import Sentinel
 
 
-@pytest.fixture(autouse='function')
+@pytest.fixture(autouse=True)
 def reset_cli_args():
     co.GlobalCLIArgs._Singleton__instance = None
     yield
     co.GlobalCLIArgs._Singleton__instance = None
 
 
-@pytest.fixture()
-def collection_input(tmp_path_factory):
-    ''' Creates a collection skeleton directory for build tests '''
-    test_dir = to_text(tmp_path_factory.mktemp('test-ÅÑŚÌβŁÈ Collections Input'))
+@pytest.fixture
+def collection_path_suffix(request):
+    """Return test collection path suffix or the default."""
+    return getattr(request, 'param', 'test-ÅÑŚÌβŁÈ Collections Input')
+
+
+@pytest.fixture
+def collection_input(tmp_path_factory, collection_path_suffix):
+    """Create a collection skeleton directory for build tests."""
+    test_dir = to_text(tmp_path_factory.mktemp(collection_path_suffix))
+
     namespace = 'ansible_namespace'
     collection = 'collection'
     skeleton = os.path.join(os.path.dirname(os.path.split(__file__)[0]), 'cli', 'test_data', 'collection_skeleton')
@@ -58,7 +64,7 @@ def collection_input(tmp_path_factory):
 
 @pytest.fixture()
 def collection_artifact(monkeypatch, tmp_path_factory):
-    ''' Creates a temp collection artifact and mocked open_url instance for publishing tests '''
+    """ Creates a temp collection artifact and mocked open_url instance for publishing tests """
     mock_open = MagicMock()
     monkeypatch.setattr(collection.concrete_artifact_manager, 'open_url', mock_open)
 
@@ -73,7 +79,7 @@ def collection_artifact(monkeypatch, tmp_path_factory):
         b_io = BytesIO(b"\x00\x01\x02\x03")
         tar_info = tarfile.TarInfo('test')
         tar_info.size = 4
-        tar_info.mode = 0o0644
+        tar_info.mode = S_IRWU_RG_RO
         tfile.addfile(tarinfo=tar_info, fileobj=b_io)
 
     return input_file, mock_open
@@ -91,7 +97,7 @@ def galaxy_yml_dir(request, tmp_path_factory):
 
 @pytest.fixture()
 def tmp_tarfile(tmp_path_factory, manifest_info):
-    ''' Creates a temporary tar file for _extract_tar_file tests '''
+    """ Creates a temporary tar file for _extract_tar_file tests """
     filename = u'ÅÑŚÌβŁÈ'
     temp_dir = to_bytes(tmp_path_factory.mktemp('test-%s Collections' % to_native(filename)))
     tar_file = os.path.join(temp_dir, to_bytes('%s.tar.gz' % filename))
@@ -101,14 +107,14 @@ def tmp_tarfile(tmp_path_factory, manifest_info):
         b_io = BytesIO(data)
         tar_info = tarfile.TarInfo(filename)
         tar_info.size = len(data)
-        tar_info.mode = 0o0644
+        tar_info.mode = S_IRWU_RG_RO
         tfile.addfile(tarinfo=tar_info, fileobj=b_io)
 
         b_data = to_bytes(json.dumps(manifest_info, indent=True), errors='surrogate_or_strict')
         b_io = BytesIO(b_data)
         tar_info = tarfile.TarInfo('MANIFEST.json')
         tar_info.size = len(b_data)
-        tar_info.mode = 0o0644
+        tar_info.mode = S_IRWU_RG_RO
         tfile.addfile(tarinfo=tar_info, fileobj=b_io)
 
     sha256_hash = sha256()
@@ -408,9 +414,9 @@ def test_timeout_server_config(timeout_cli, timeout_cfg, timeout_fallback, expec
         cfg_lines.append(f"server_timeout={timeout_fallback}")
 
         # fix default in server config since C.GALAXY_SERVER_TIMEOUT was already evaluated
-        server_additional = galaxy.SERVER_ADDITIONAL.copy()
+        server_additional = manager.GALAXY_SERVER_ADDITIONAL.copy()
         server_additional['timeout']['default'] = timeout_fallback
-        monkeypatch.setattr(galaxy, 'SERVER_ADDITIONAL', server_additional)
+        monkeypatch.setattr(manager, 'GALAXY_SERVER_ADDITIONAL', server_additional)
 
     cfg_lines.extend(["[galaxy_server.server1]", "url=https://galaxy.ansible.com/api/"])
     if timeout_cfg is not None:
@@ -467,6 +473,14 @@ def test_build_existing_output_without_force(collection_input):
         collection.build_collection(to_text(input_dir, errors='surrogate_or_strict'), to_text(output_dir, errors='surrogate_or_strict'), False)
 
 
+@pytest.mark.parametrize(
+    'collection_path_suffix',
+    (
+        'test-ÅÑŚÌβŁÈ Collections Input 1 with_slash/',
+        'test-ÅÑŚÌβŁÈ Collections Input 2 no slash',
+    ),
+    indirect=('collection_path_suffix', ),
+)
 def test_build_existing_output_with_force(collection_input):
     input_dir, output_dir = collection_input
 
@@ -827,12 +841,26 @@ def test_build_with_symlink_inside_collection(collection_input):
         assert actual_file == '08f24200b9fbe18903e7a50930c9d0df0b8d7da3'  # shasum test/units/cli/test_data/collection_skeleton/README.md
 
 
+def test_build_files_manifest_sorted_by_name(collection_input):
+    """Verify _build_files_manifest returns files sorted by name."""
+    input_dir = collection_input[0]
+
+    for filename in ['z.txt', 'a.txt', 'm.txt']:
+        with open(os.path.join(input_dir, filename), 'w') as f:
+            f.write('test')
+
+    manifest = collection._build_files_manifest(to_bytes(input_dir), 'namespace', 'collection', [], Sentinel, None)
+    names = [entry['name'] for entry in manifest['files']]
+
+    assert names == sorted(names)
+
+
 def test_publish_no_wait(galaxy_server, collection_artifact, monkeypatch):
     mock_display = MagicMock()
     monkeypatch.setattr(Display, 'display', mock_display)
 
     artifact_path, mock_open = collection_artifact
-    fake_import_uri = 'https://galaxy.server.com/api/v2/import/1234'
+    fake_import_uri = 'https://galaxy.server.com/api/v3/import/1234'
 
     mock_publish = MagicMock()
     mock_publish.return_value = fake_import_uri
@@ -855,7 +883,7 @@ def test_publish_with_wait(galaxy_server, collection_artifact, monkeypatch):
     monkeypatch.setattr(Display, 'display', mock_display)
 
     artifact_path, mock_open = collection_artifact
-    fake_import_uri = 'https://galaxy.server.com/api/v2/import/1234'
+    fake_import_uri = 'https://galaxy.server.com/api/v3/import/1234'
 
     mock_publish = MagicMock()
     mock_publish.return_value = fake_import_uri
@@ -870,7 +898,7 @@ def test_publish_with_wait(galaxy_server, collection_artifact, monkeypatch):
     assert mock_publish.mock_calls[0][1][0] == artifact_path
 
     assert mock_wait.call_count == 1
-    assert mock_wait.mock_calls[0][1][0] == '1234'
+    assert mock_wait.mock_calls[0][1][0] == fake_import_uri
 
     assert mock_display.mock_calls[0][1][0] == "Collection has been published to the Galaxy server test_server %s" \
         % galaxy_server.api_server
@@ -949,7 +977,7 @@ def test_extract_tar_file_outside_dir(tmp_path_factory):
         b_io = BytesIO(data)
         tar_info = tarfile.TarInfo(tar_filename)
         tar_info.size = len(data)
-        tar_info.mode = 0o0644
+        tar_info.mode = S_IRWU_RG_RO
         tfile.addfile(tarinfo=tar_info, fileobj=b_io)
 
     expected = re.escape("Cannot extract tar entry '%s' as it will be placed outside the collection directory"

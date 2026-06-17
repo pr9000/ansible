@@ -31,7 +31,7 @@ variables:
   - name: fetchDepth
     value: 500
   - name: defaultContainer
-    value: quay.io/ansible/azure-pipelines-test-container:4.0.1
+    value: quay.io/ansible/azure-pipelines-test-container:8.0.0
 
 pool: Standard
 
@@ -54,13 +54,13 @@ stages:
           nameFormat: Python {0}
           testFormat: units/{0}
           targets:
-            - test: 2.7
-            - test: 3.6
-            - test: 3.7
-            - test: 3.8
             - test: 3.9
             - test: '3.10'
             - test: 3.11
+            - test: 3.12
+            - test: 3.13
+            - test: 3.14
+            - test: 3.15
   - stage: Windows
     dependsOn: []
     jobs:
@@ -69,45 +69,58 @@ stages:
           nameFormat: Server {0}
           testFormat: windows/{0}/1
           targets:
-            - test: 2016
-            - test: 2019
-            - test: 2022
+            - name: 2019 WinRM HTTPS WinPS
+              test: 2019/winrm/https/5.1
+            - name: 2022 WinRM HTTPS WinPS
+              test: 2022/winrm/https/5.1
+            - name: 2022 PSRP HTTP WinPS
+              test: 2022/psrp/http/5.1
+            - name: 2022 SSH Key WinPS
+              test: 2022/ssh/key/5.1
+            - name: 2025 PSRP HTTP WinPS
+              test: 2025/psrp/http/5.1
+            - name: 2025 SSH Key WinPS
+              test: 2025/ssh/key/5.1
+            - name: 2025 WinRM HTTP Pwsh
+              test: 2025/winrm/http/7.6
+            - name: 2025 PSRP HTTP Pwsh
+              test: 2025/psrp/http/7.6
+            - name: 2025 SSH Key Pwsh
+              test: 2025/ssh/key/7.6
   - stage: Remote
     dependsOn: []
     jobs:
       - template: templates/matrix.yml  # context/target
         parameters:
           targets:
-            - name: macOS 13.2
-              test: macos/13.2
-            - name: RHEL 7.9
-              test: rhel/7.9
-            - name: RHEL 8.8 py36
-              test: rhel/8.8@3.6
-            - name: RHEL 8.8 py311
-              test: rhel/8.8@3.11
-            - name: RHEL 9.2 py39
-              test: rhel/9.2@3.9
-            - name: RHEL 9.2 py311
-              test: rhel/9.2@3.11
-            - name: FreeBSD 12.4
-              test: freebsd/12.4
-            - name: FreeBSD 13.2
-              test: freebsd/13.2
+            - name: macOS 26.3
+              test: macos/26.3
+            - name: RHEL 9.7 py39
+              test: rhel/9.7@3.9
+            - name: RHEL 9.7 py314
+              test: rhel/9.7@3.14
+            - name: RHEL 10.1 py312
+              test: rhel/10.1@3.12
+            - name: RHEL 10.1 py314
+              test: rhel/10.1@3.14
+            - name: FreeBSD 14.4
+              test: freebsd/14.4
+            - name: FreeBSD 15.0
+              test: freebsd/15.0
           groups:
             - 1
             - 2
       - template: templates/matrix.yml  # context/controller
         parameters:
           targets:
-            - name: macOS 13.2
-              test: macos/13.2
-            - name: RHEL 8.8
-              test: rhel/8.8
-            - name: RHEL 9.2
-              test: rhel/9.2
-            - name: FreeBSD 13.2
-              test: freebsd/13.2
+            - name: macOS 26.3
+              test: macos/26.3
+            - name: RHEL 9.7
+              test: rhel/9.7
+            - name: RHEL 10.1
+              test: rhel/10.1
+            - name: FreeBSD 14.4
+              test: freebsd/14.4
           groups:
             - 3
             - 4
@@ -115,56 +128,75 @@ stages:
       - template: templates/matrix.yml  # context/controller (ansible-test container management)
         parameters:
           targets:
-            - name: Alpine 3.17
-              test: alpine/3.17
-            - name: Alpine 3.18
-              test: alpine/3.18
-            - name: Fedora 38
-              test: fedora/38
-            - name: RHEL 8.8
-              test: rhel/8.8
-            - name: RHEL 9.2
-              test: rhel/9.2
-            - name: Ubuntu 22.04
-              test: ubuntu/22.04
+            - name: Fedora 44
+              test: fedora/44
+            - name: RHEL 9.7
+              test: rhel/9.7
+            - name: RHEL 10.1
+              test: rhel/10.1
+            - name: Ubuntu 26.04
+              test: ubuntu/26.04
           groups:
             - 6
+  - stage: Remote_Targeted
+    displayName: Remote Targeted
+    dependsOn: []
+    jobs:
+      - template: templates/matrix.yml  # targeted tests
+        parameters:
+          testFormat: "{0}/targeted"
+          targets:
+            - name: RHEL 8.10
+              test: rhel/8.10/rhel8
   - stage: Docker
     dependsOn: []
     jobs:
-      - template: templates/matrix.yml
+      - template: templates/matrix.yml  # context/target
         parameters:
           testFormat: linux/{0}
           targets:
-            - name: Alpine 3
-              test: alpine3
-            - name: CentOS 7
-              test: centos7
-            - name: Fedora 38
-              test: fedora38
-            - name: openSUSE 15
-              test: opensuse15
-            - name: Ubuntu 20.04
-              test: ubuntu2004
-            - name: Ubuntu 22.04
-              test: ubuntu2204
+            - name: Alpine 3.23
+              test: alpine323
+            - name: Fedora 44
+              test: fedora44
+            - name: Ubuntu 24.04
+              test: ubuntu2404
+            - name: Ubuntu 26.04
+              test: ubuntu2604
           groups:
             - 1
             - 2
-      - template: templates/matrix.yml
+      - template: templates/matrix.yml  # context/controller
         parameters:
           testFormat: linux/{0}
           targets:
-            - name: Alpine 3
-              test: alpine3
-            - name: Fedora 38
-              test: fedora38
-            - name: Ubuntu 22.04
-              test: ubuntu2204
+            - name: Fedora 44
+              test: fedora44
+            - name: Ubuntu 24.04
+              test: ubuntu2404
+            - name: Ubuntu 26.04
+              test: ubuntu2604
           groups:
             - 3
             - 4
             - 5
+      - template: templates/matrix.yml  # context/target (dnf-oldest, dnf-latest)
+        parameters:
+          testFormat: linux/{0}
+          targets:
+            - name: Fedora 44
+              test: fedora44
+          groups:
+            - 7
+  - stage: PowerShell
+    dependsOn: []
+    jobs:
+      - template: templates/matrix.yml
+        parameters:
+          nameFormat: PowerShell {0}
+          testFormat: powershell/{0}/1
+          targets:
+            - name: 7.6
   - stage: Galaxy
     dependsOn: []
     jobs:
@@ -173,8 +205,9 @@ stages:
           nameFormat: Python {0}
           testFormat: galaxy/{0}/1
           targets:
-            - test: '3.10'
-            - test: 3.11
+            - test: 3.13
+            - test: 3.14
+            - test: 3.15
   - stage: Generic
     dependsOn: []
     jobs:
@@ -183,8 +216,9 @@ stages:
           nameFormat: Python {0}
           testFormat: generic/{0}/1
           targets:
-            - test: '3.10'
-            - test: 3.11
+            - test: 3.13
+            - test: 3.14
+            - test: 3.15
   - stage: Incidental_Windows
     displayName: Incidental Windows
     dependsOn: []
@@ -194,20 +228,24 @@ stages:
           nameFormat: Server {0}
           testFormat: i/windows/{0}
           targets:
-            - test: 2016
-            - test: 2019
-            - test: 2022
-  - stage: Incidental
-    dependsOn: []
-    jobs:
-      - template: templates/matrix.yml
-        parameters:
-          testFormat: i/{0}/1
-          targets:
-            - name: IOS Python
-              test: ios/csr1000v/
-            - name: VyOS Python
-              test: vyos/1.1.8/
+            - name: 2019 WinRM HTTPS WinPS
+              test: 2019/winrm/https/5.1
+            - name: 2022 WinRM HTTPS WinPS
+              test: 2022/winrm/https/5.1
+            - name: 2022 PSRP HTTP WinPS
+              test: 2022/psrp/http/5.1
+            - name: 2022 SSH Key WinPS
+              test: 2022/ssh/key/5.1
+            - name: 2025 PSRP HTTP WinPS
+              test: 2025/psrp/http/5.1
+            - name: 2025 SSH Key WinPS
+              test: 2025/ssh/key/5.1
+            - name: 2025 WinRM HTTP Pwsh
+              test: 2025/winrm/http/7.6
+            - name: 2025 PSRP HTTP Pwsh
+              test: 2025/psrp/http/7.6
+            - name: 2025 SSH Key Pwsh
+              test: 2025/ssh/key/7.6
   - stage: Summary
     condition: succeededOrFailed()
     dependsOn:
@@ -215,10 +253,11 @@ stages:
       - Units
       - Windows
       - Remote
+      - Remote_Targeted
       - Docker
+      - PowerShell
       - Galaxy
       - Generic
       - Incidental_Windows
-      - Incidental
     jobs:
       - template: templates/coverage.yml

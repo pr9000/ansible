@@ -16,13 +16,12 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import os
+import sys
 
-from units.compat import unittest
+import unittest
 from unittest.mock import patch, MagicMock
 from ansible.plugins.loader import PluginLoader, PluginPathContext
 
@@ -51,10 +50,12 @@ class TestErrors(unittest.TestCase):
         bam = MagicMock()
         bam.__file__ = '/path/to/my/foo/bar/bam/__init__.py'
         bar_pkg.bam = bam
-        foo_pkg.return_value.bar = bar_pkg
+        foo_pkg.bar = bar_pkg
         pl = PluginLoader('test', 'foo.bar.bam', 'test', 'test_plugin')
-        with patch('builtins.__import__', foo_pkg):
-            self.assertEqual(pl._get_package_paths(), ['/path/to/my/foo/bar/bam'])
+        sys.modules['foo'] = foo_pkg
+        sys.modules['foo.bar'] = bar_pkg
+        sys.modules['foo.bar.bam'] = bam
+        self.assertEqual(pl._get_package_paths(), ['/path/to/my/foo/bar/bam'])
 
     def test_plugins__get_paths(self):
         pl = PluginLoader('test', '', 'test', 'test_plugin')
@@ -88,28 +89,28 @@ class TestErrors(unittest.TestCase):
         self.assertPluginLoaderConfigBecomes(None, [])
 
     def test__load_module_source_no_duplicate_names(self):
-        '''
+        """
         This test simulates importing 2 plugins with the same name,
         and validating that the import is short circuited if a file with the same name
         has already been imported
-        '''
+        """
 
         fixture_path = os.path.join(os.path.dirname(__file__), 'loader_fixtures')
 
         pl = PluginLoader('test', '', 'test', 'test_plugin')
-        one = pl._load_module_source('import_fixture', os.path.join(fixture_path, 'import_fixture.py'))
+        one = pl._load_module_source(python_module_name='import_fixture', path=os.path.join(fixture_path, 'import_fixture.py'))
         # This line wouldn't even succeed if we didn't short circuit on finding a duplicate name
-        two = pl._load_module_source('import_fixture', '/path/to/import_fixture.py')
+        two = pl._load_module_source(python_module_name='import_fixture', path='/path/to/import_fixture.py')
 
         self.assertEqual(one, two)
 
     @patch('ansible.plugins.loader.glob')
     @patch.object(PluginLoader, '_get_paths_with_context')
     def test_all_no_duplicate_names(self, gp_mock, glob_mock):
-        '''
+        """
         This test goes along with ``test__load_module_source_no_duplicate_names``
         and ensures that we ignore duplicate imports on multiple paths
-        '''
+        """
 
         fixture_path = os.path.join(os.path.dirname(__file__), 'loader_fixtures')
 

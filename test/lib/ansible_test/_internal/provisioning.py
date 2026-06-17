@@ -1,4 +1,5 @@
 """Provision hosts for running tests."""
+
 from __future__ import annotations
 
 import collections.abc as c
@@ -47,9 +48,6 @@ from .pypi_proxy import (
     run_pypi_proxy,
 )
 
-THostProfile = t.TypeVar('THostProfile', bound=HostProfile)
-TEnvironmentConfig = t.TypeVar('TEnvironmentConfig', bound=EnvironmentConfig)
-
 
 class PrimeContainers(ApplicationError):
     """Exception raised to end execution early after priming containers."""
@@ -90,7 +88,7 @@ class HostState:
         return list(itertools.chain.from_iterable([target.get_controller_target_connections() for
                                                    target in self.target_profiles if isinstance(target, SshTargetHostProfile)]))
 
-    def targets(self, profile_type: t.Type[THostProfile]) -> list[THostProfile]:
+    def targets[THostProfile: HostProfile](self, profile_type: t.Type[THostProfile]) -> list[THostProfile]:
         """The list of target(s), verified to be of the specified type."""
         if not self.target_profiles:
             raise Exception('No target profiles found.')
@@ -100,7 +98,7 @@ class HostState:
         return t.cast(list[THostProfile], self.target_profiles)
 
 
-def prepare_profiles(
+def prepare_profiles[TEnvironmentConfig: EnvironmentConfig](
     args: TEnvironmentConfig,
     targets_use_pypi: bool = False,
     skip_setup: bool = False,
@@ -115,9 +113,11 @@ def prepare_profiles(
     else:
         run_pypi_proxy(args, targets_use_pypi)
 
+        controller_host_profile = t.cast(ControllerHostProfile, create_host_profile(args, args.controller, None))
+
         host_state = HostState(
-            controller_profile=t.cast(ControllerHostProfile, create_host_profile(args, args.controller, True)),
-            target_profiles=[create_host_profile(args, target, False) for target in args.targets],
+            controller_profile=controller_host_profile,
+            target_profiles=[create_host_profile(args, target, controller_host_profile) for target in args.targets],
         )
 
         if args.prime_containers:
@@ -129,6 +129,9 @@ def prepare_profiles(
 
         ExitHandler.register(functools.partial(cleanup_profiles, host_state))
 
+        for pre_profile in host_state.profiles:
+            pre_profile.pre_provision()
+
         def provision(profile: HostProfile) -> None:
             """Provision the given profile."""
             profile.provision()
@@ -136,12 +139,15 @@ def prepare_profiles(
             if not skip_setup:
                 profile.setup()
 
-        dispatch_jobs([(profile, WrappedThread(functools.partial(provision, profile))) for profile in host_state.profiles])
+        dispatch_jobs(
+            [(profile, WrappedThread(functools.partial(provision, profile), f'Provision: {profile}')) for profile in host_state.profiles]
+        )
 
         host_state.controller_profile.configure()
 
     if not args.delegate:
         check_controller_python(args, host_state)
+        check_controller_powershell(args, host_state)
 
         if requirements:
             requirements(host_state.controller_profile)
@@ -156,7 +162,9 @@ def prepare_profiles(
             if requirements:
                 requirements(profile)
 
-        dispatch_jobs([(profile, WrappedThread(functools.partial(configure, profile))) for profile in host_state.target_profiles])
+        dispatch_jobs(
+            [(profile, WrappedThread(functools.partial(configure, profile), f'Configure: {profile}')) for profile in host_state.target_profiles]
+        )
 
     return host_state
 
@@ -175,6 +183,13 @@ def check_controller_python(args: EnvironmentConfig, host_state: HostState) -> N
         raise ApplicationError(f'Running under Python version {sys_version} instead of {expected_version}.')
 
     args.controller_python = controller_python
+
+
+def check_controller_powershell(args: EnvironmentConfig, host_state: HostState) -> None:
+    """Check the running environment to make sure it is what we expected."""
+    controller_powershell = host_state.controller_profile.powershell
+
+    args.controller_powershell = controller_powershell
 
 
 def cleanup_profiles(host_state: HostState) -> None:

@@ -1,4 +1,5 @@
 """Sanity test to check integration test aliases."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -180,6 +181,8 @@ class IntegrationAliasesTest(SanitySingleVersion):
         group_numbers = self.ci_test_groups.get(name, None)
 
         if group_numbers:
+            group_numbers = [num for num in group_numbers if num not in (6, 7)]  # HACK: ignore special groups 6 and 7
+
             if min(group_numbers) != 1:
                 display.warning('Min test group "%s" in %s is %d instead of 1.' % (name, self.CI_YML, min(group_numbers)), unique=True)
 
@@ -256,13 +259,16 @@ class IntegrationAliasesTest(SanitySingleVersion):
 
         messages += self.check_ci_group(
             targets=tuple(filter_targets(posix_targets, ['cloud/', '%s/generic/' % self.TEST_ALIAS_PREFIX], include=False, errors=False)),
-            find=self.format_test_group_alias('linux').replace('linux', 'posix'),
+            find=[
+                self.format_test_group_alias('linux').replace('linux', 'posix'),
+                self.format_test_group_alias('powershell'),
+            ],
             find_incidental=['%s/posix/incidental/' % self.TEST_ALIAS_PREFIX],
         )
 
         messages += self.check_ci_group(
             targets=tuple(filter_targets(posix_targets, ['%s/generic/' % self.TEST_ALIAS_PREFIX], errors=False)),
-            find=self.format_test_group_alias('generic'),
+            find=[self.format_test_group_alias('generic')],
         )
 
         for cloud in clouds:
@@ -275,7 +281,7 @@ class IntegrationAliasesTest(SanitySingleVersion):
 
             messages += self.check_ci_group(
                 targets=tuple(filter_targets(posix_targets, ['cloud/%s/' % cloud], errors=False)),
-                find=find,
+                find=[find],
                 find_incidental=find_incidental,
             )
 
@@ -289,6 +295,9 @@ class IntegrationAliasesTest(SanitySingleVersion):
         for target in posix_targets:
             if target.name == 'ansible-test-container':
                 continue  # special test target which uses group 6 -- nothing else should be in that group
+
+            if target.name in ('dnf-oldest', 'dnf-latest'):
+                continue  # special test targets which use group 7 -- nothing else should be in that group
 
             if f'{self.TEST_ALIAS_PREFIX}/posix/' not in target.aliases:
                 continue
@@ -316,7 +325,7 @@ class IntegrationAliasesTest(SanitySingleVersion):
 
         messages += self.check_ci_group(
             targets=windows_targets,
-            find=self.format_test_group_alias('windows'),
+            find=[self.format_test_group_alias('windows')],
             find_incidental=['%s/windows/incidental/' % self.TEST_ALIAS_PREFIX],
         )
 
@@ -325,12 +334,12 @@ class IntegrationAliasesTest(SanitySingleVersion):
     def check_ci_group(
         self,
         targets: tuple[CompletionTarget, ...],
-        find: str,
+        find: list[str],
         find_incidental: t.Optional[list[str]] = None,
     ) -> list[SanityMessage]:
         """Check the CI groups set in the provided targets and return a list of messages with any issues found."""
         all_paths = set(target.path for target in targets)
-        supported_paths = set(target.path for target in filter_targets(targets, [find], errors=False))
+        supported_paths = set(target.path for target in filter_targets(targets, find, errors=False))
         unsupported_paths = set(target.path for target in filter_targets(targets, [self.UNSUPPORTED], errors=False))
 
         if find_incidental:
@@ -341,14 +350,21 @@ class IntegrationAliasesTest(SanitySingleVersion):
         unassigned_paths = all_paths - supported_paths - unsupported_paths - incidental_paths
         conflicting_paths = supported_paths & unsupported_paths
 
-        unassigned_message = 'missing alias `%s` or `%s`' % (find.strip('/'), self.UNSUPPORTED.strip('/'))
-        conflicting_message = 'conflicting alias `%s` and `%s`' % (find.strip('/'), self.UNSUPPORTED.strip('/'))
+        valid_aliases = '`, `'.join([f.strip('/') for f in find])
+        unassigned_message = 'missing alias `%s` or `%s`' % (valid_aliases, self.UNSUPPORTED.strip('/'))
+        conflicting_message = 'conflicting alias `%s` and `%s`' % (valid_aliases, self.UNSUPPORTED.strip('/'))
 
         messages = []
 
         for path in unassigned_paths:
             if path == 'test/integration/targets/ansible-test-container':
                 continue  # special test target which uses group 6 -- nothing else should be in that group
+
+            if path in (
+                'test/integration/targets/dnf-oldest',
+                'test/integration/targets/dnf-latest',
+            ):
+                continue  # special test targets which use group 7 -- nothing else should be in that group
 
             messages.append(SanityMessage(unassigned_message, '%s/aliases' % path))
 

@@ -2,9 +2,7 @@
 # Copyright: (c) 2017, Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import os
 import os.path
@@ -193,7 +191,7 @@ class TestFindIniFile:
         assert u'Ansible is being run in a world writable directory' in warning
         assert u'ignoring it as an ansible.cfg source' in warning
 
-    # ANSIBLE_CONFIG is sepcified
+    # ANSIBLE_CONFIG is specified
     @pytest.mark.parametrize('setup_env, expected', (([alt_cfg_file], alt_cfg_file), ([cfg_in_cwd], cfg_in_cwd)), indirect=['setup_env'])
     # All config files are present
     @pytest.mark.parametrize('setup_existing_files',

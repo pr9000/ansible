@@ -3,12 +3,12 @@
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 """Installed collections management package."""
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-import errno
 import fnmatch
 import functools
+import glob
+import inspect
 import json
 import os
 import pathlib
@@ -26,25 +26,24 @@ import typing as t
 
 from collections import namedtuple
 from contextlib import contextmanager
-from dataclasses import dataclass, fields as dc_fields
+from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
 from importlib.metadata import distribution
+from importlib.resources import files
 from itertools import chain
+from operator import itemgetter
 
 try:
     from packaging.requirements import Requirement as PkgReq
 except ImportError:
-    class PkgReq:  # type: ignore[no-redef]
-        pass
-
     HAS_PACKAGING = False
 else:
     HAS_PACKAGING = True
 
 try:
-    from distlib.manifest import Manifest  # type: ignore[import]
-    from distlib import DistlibException  # type: ignore[import]
+    from distlib.manifest import Manifest
+    from distlib import DistlibException
 except ImportError:
     HAS_DISTLIB = False
 else:
@@ -81,10 +80,12 @@ if t.TYPE_CHECKING:
     ManifestValueType = t.Dict[CollectionInfoKeysType, t.Union[int, str, t.List[str], t.Dict[str, str], None]]
     CollectionManifestType = t.Dict[ManifestKeysType, ManifestValueType]
     FileManifestEntryType = t.Dict[FileMetaKeysType, t.Union[str, int, None]]
-    FilesManifestType = t.Dict[t.Literal['files', 'format'], t.Union[t.List[FileManifestEntryType], int]]
+
+    class FilesManifestType(t.TypedDict):
+        files: t.List[FileManifestEntryType]
+        format: int
 
 import ansible.constants as C
-from ansible.compat.importlib_resources import files
 from ansible.errors import AnsibleError
 from ansible.galaxy.api import GalaxyAPI
 from ansible.galaxy.collection.concrete_artifact_manager import (
@@ -124,13 +125,14 @@ from ansible.galaxy.dependency_resolution.dataclasses import (
 )
 from ansible.galaxy.dependency_resolution.versioning import meets_requirements
 from ansible.plugins.loader import get_all_plugin_loaders
+from ansible.module_utils.common.file import S_IRWU_RG_RO, S_IRWXU_RXG_RXO, S_IXANY
+from ansible.module_utils.common.sentinel import Sentinel
 from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
 from ansible.module_utils.common.collections import is_sequence
 from ansible.module_utils.common.yaml import yaml_dump
 from ansible.utils.collection_loader import AnsibleCollectionRef
 from ansible.utils.display import Display
 from ansible.utils.hashing import secure_hash, secure_hash_s
-from ansible.utils.sentinel import Sentinel
 
 
 display = Display()
@@ -152,9 +154,9 @@ class ManifestControl:
         # Allow a dict representing this dataclass to be splatted directly.
         # Requires attrs to have a default value, so anything with a default
         # of None is swapped for its, potentially mutable, default
-        for field in dc_fields(self):
-            if getattr(self, field.name) is None:
-                super().__setattr__(field.name, field.type())
+        for field_name, field_type in inspect.get_annotations(type(self), eval_str=True).items():
+            if getattr(self, field_name) is None:
+                super().__setattr__(field_name, field_type())
 
 
 class CollectionSignatureError(Exception):
@@ -199,9 +201,9 @@ class CollectionSignatureError(Exception):
 
 # FUTURE: expose actual verify result details for a collection on this object, maybe reimplement as dataclass on py3.8+
 class CollectionVerifyResult:
-    def __init__(self, collection_name):  # type: (str) -> None
-        self.collection_name = collection_name  # type: str
-        self.success = True  # type: bool
+    def __init__(self, collection_name: str) -> None:
+        self.collection_name = collection_name
+        self.success = True
 
 
 def verify_local_collection(local_collection, remote_collection, artifacts_manager):
@@ -333,11 +335,18 @@ def verify_local_collection(local_collection, remote_collection, artifacts_manag
                 os.path.join(b_collection_path, to_bytes(name, errors='surrogate_or_strict'))
             )
 
+    b_ignore_patterns = [
+        b'*.pyc',
+    ]
+
     # Find any paths not in the FILES.json
-    for root, dirs, files in os.walk(b_collection_path):
-        for name in files:
+    for root, dirs, filenames in os.walk(b_collection_path):
+        for name in filenames:
             full_path = os.path.join(root, name)
             path = to_text(full_path[len(b_collection_path) + 1::], errors='surrogate_or_strict')
+            if any(fnmatch.fnmatch(full_path, b_pattern) for b_pattern in b_ignore_patterns):
+                display.v("Ignoring verification for %s" % to_text(full_path))
+                continue
 
             if full_path not in collection_files:
                 modified_content.append(
@@ -542,9 +551,11 @@ def download_collections(
             format(path=output_path),
     ):
         for fqcn, concrete_coll_pin in dep_map.copy().items():  # FIXME: move into the provider
+            if concrete_coll_pin.type == "requires_ansible":
+                continue
             if concrete_coll_pin.is_virtual:
                 display.display(
-                    'Virtual collection {coll!s} is not downloadable'.
+                    '{coll!s} is not downloadable'.
                     format(coll=to_text(concrete_coll_pin)),
                 )
                 continue
@@ -615,24 +626,11 @@ def publish_collection(collection_path, api, wait, timeout):
     import_uri = api.publish_collection(collection_path)
 
     if wait:
-        # Galaxy returns a url fragment which differs between v2 and v3.  The second to last entry is
-        # always the task_id, though.
-        # v2: {"task": "https://galaxy-dev.ansible.com/api/v2/collection-imports/35573/"}
-        # v3: {"task": "/api/automation-hub/v3/imports/collections/838d1308-a8f4-402c-95cb-7823f3806cd8/"}
-        task_id = None
-        for path_segment in reversed(import_uri.split('/')):
-            if path_segment:
-                task_id = path_segment
-                break
-
-        if not task_id:
-            raise AnsibleError("Publishing the collection did not return valid task info. Cannot wait for task status. Returned task info: '%s'" % import_uri)
-
         with _display_progress(
                 "Collection has been published to the Galaxy server "
                 "{api.name!s} {api.api_server!s}".format(api=api),
         ):
-            api.wait_import_task(task_id, timeout)
+            api.wait_import_task(import_uri, timeout)
         display.display("Collection has been successfully published and imported to the Galaxy server %s %s"
                         % (api.name, api.api_server))
     else:
@@ -654,6 +652,7 @@ def install_collections(
         artifacts_manager,  # type: ConcreteArtifactsManager
         disable_gpg_verify,  # type: bool
         offline,  # type: bool
+        read_requirement_paths,  # type: set[str]
 ):  # type: (...) -> None
     """Install Ansible collections to the path specified.
 
@@ -668,7 +667,8 @@ def install_collections(
     """
     existing_collections = {
         Requirement(coll.fqcn, coll.ver, coll.src, coll.type, None)
-        for coll in find_existing_collections(output_path, artifacts_manager)
+        for path in {output_path} | read_requirement_paths
+        for coll in find_existing_collections(path, artifacts_manager)
     }
 
     unsatisfied_requirements = set(
@@ -737,9 +737,11 @@ def install_collections(
     keyring_exists = artifacts_manager.keyring is not None
     with _display_progress("Starting collection install process"):
         for fqcn, concrete_coll_pin in dependency_map.items():
+            if concrete_coll_pin.type == "requires_ansible":
+                continue
             if concrete_coll_pin.is_virtual:
                 display.vvvv(
-                    "'{coll!s}' is virtual, skipping.".
+                    "Encountered {coll!s}, skipping.".
                     format(coll=to_text(concrete_coll_pin)),
                 )
                 continue
@@ -869,6 +871,11 @@ def verify_collections(
                     local_collection = Candidate.from_dir_path(
                         b_search_path, artifacts_manager,
                     )
+
+                    if local_collection.fqcn != collection.fqcn:
+                        default_err = f"Collection at '{to_text(local_collection.src)}' documents incorrect FQCN '{local_collection.fqcn}'"
+                        continue
+
                     supplemental_signatures = [
                         get_signature_from_source(source, display)
                         for source in collection.signature_sources or []
@@ -1067,15 +1074,19 @@ def _build_files_manifest(b_collection_path, namespace, name, ignore_patterns,
         raise AnsibleError('"build_ignore" and "manifest" are mutually exclusive')
 
     if manifest_control is not Sentinel:
-        return _build_files_manifest_distlib(
+        manifest = _build_files_manifest_distlib(
             b_collection_path,
             namespace,
             name,
             manifest_control,
             license_file,
         )
+    else:
+        manifest = _build_files_manifest_walk(b_collection_path, namespace, name, ignore_patterns)
 
-    return _build_files_manifest_walk(b_collection_path, namespace, name, ignore_patterns)
+    manifest['files'].sort(key=itemgetter('name'))
+
+    return manifest
 
 
 def _build_files_manifest_distlib(b_collection_path, namespace, name, manifest_control,
@@ -1177,7 +1188,6 @@ def _build_files_manifest_distlib(b_collection_path, namespace, name, manifest_c
             )
 
         manifest['files'].append(manifest_entry)
-
     return manifest
 
 
@@ -1201,10 +1211,17 @@ def _build_files_manifest_walk(b_collection_path, namespace, name, ignore_patter
 
     manifest = _make_manifest()
 
+    def _discover_relative_base_directory(b_path: bytes, b_top_level_dir: bytes) -> bytes:
+        if b_path == b_top_level_dir:
+            return b''
+        common_prefix = os.path.commonpath((b_top_level_dir, b_path))
+        b_rel_base_dir = os.path.relpath(b_path, common_prefix)
+        return b_rel_base_dir.lstrip(os.path.sep.encode())
+
     def _walk(b_path, b_top_level_dir):
+        b_rel_base_dir = _discover_relative_base_directory(b_path, b_top_level_dir)
         for b_item in os.listdir(b_path):
             b_abs_path = os.path.join(b_path, b_item)
-            b_rel_base_dir = b'' if b_path == b_top_level_dir else b_path[len(b_top_level_dir) + 1:]
             b_rel_path = os.path.join(b_rel_base_dir, b_item)
             rel_path = to_text(b_rel_path, errors='surrogate_or_strict')
 
@@ -1287,7 +1304,7 @@ def _build_collection_tar(
         file_manifest,  # type: FilesManifestType
 ):  # type: (...) -> str
     """Build a tar.gz collection artifact from the manifest data."""
-    files_manifest_json = to_bytes(json.dumps(file_manifest, indent=True), errors='surrogate_or_strict')
+    files_manifest_json = to_bytes(json.dumps(file_manifest, indent=True, sort_keys=True), errors='surrogate_or_strict')
     collection_manifest['file_manifest_file']['chksum_sha256'] = secure_hash_s(files_manifest_json, hash_func=sha256)
     collection_manifest_json = to_bytes(json.dumps(collection_manifest, indent=True), errors='surrogate_or_strict')
 
@@ -1301,7 +1318,7 @@ def _build_collection_tar(
                 tar_info = tarfile.TarInfo(name)
                 tar_info.size = len(b)
                 tar_info.mtime = int(time.time())
-                tar_info.mode = 0o0644
+                tar_info.mode = S_IRWU_RG_RO
                 tar_file.addfile(tarinfo=tar_info, fileobj=b_io)
 
             for file_info in file_manifest['files']:  # type: ignore[union-attr]
@@ -1315,7 +1332,7 @@ def _build_collection_tar(
                 def reset_stat(tarinfo):
                     if tarinfo.type != tarfile.SYMTYPE:
                         existing_is_exec = tarinfo.mode & stat.S_IXUSR
-                        tarinfo.mode = 0o0755 if existing_is_exec or tarinfo.isdir() else 0o0644
+                        tarinfo.mode = S_IRWXU_RXG_RXO if existing_is_exec or tarinfo.isdir() else S_IRWU_RG_RO
                     tarinfo.uid = tarinfo.gid = 0
                     tarinfo.uname = tarinfo.gname = ''
 
@@ -1323,6 +1340,8 @@ def _build_collection_tar(
 
                 if os.path.islink(b_src_path):
                     b_link_target = os.path.realpath(b_src_path)
+                    if not os.path.exists(b_link_target):
+                        raise AnsibleError(f"Failed to find the target path '{to_native(b_link_target)}' for the symlink '{to_native(b_src_path)}'.")
                     if _is_child_path(b_link_target, b_collection_path):
                         b_rel_path = os.path.relpath(b_link_target, start=os.path.dirname(b_src_path))
 
@@ -1355,9 +1374,9 @@ def _build_collection_dir(b_collection_path, b_collection_output, collection_man
 
     This should follow the same pattern as _build_collection_tar.
     """
-    os.makedirs(b_collection_output, mode=0o0755)
+    os.makedirs(b_collection_output, mode=S_IRWXU_RXG_RXO)
 
-    files_manifest_json = to_bytes(json.dumps(file_manifest, indent=True), errors='surrogate_or_strict')
+    files_manifest_json = to_bytes(json.dumps(file_manifest, indent=True, sort_keys=True), errors='surrogate_or_strict')
     collection_manifest['file_manifest_file']['chksum_sha256'] = secure_hash_s(files_manifest_json, hash_func=sha256)
     collection_manifest_json = to_bytes(json.dumps(collection_manifest, indent=True), errors='surrogate_or_strict')
 
@@ -1367,10 +1386,10 @@ def _build_collection_dir(b_collection_path, b_collection_output, collection_man
         with open(b_path, 'wb') as file_obj, BytesIO(b) as b_io:
             shutil.copyfileobj(b_io, file_obj)
 
-        os.chmod(b_path, 0o0644)
+        os.chmod(b_path, S_IRWU_RG_RO)
 
     base_directories = []
-    for file_info in sorted(file_manifest['files'], key=lambda x: x['name']):
+    for file_info in file_manifest['files']:
         if file_info['name'] == '.':
             continue
 
@@ -1378,11 +1397,11 @@ def _build_collection_dir(b_collection_path, b_collection_output, collection_man
         dest_file = os.path.join(b_collection_output, to_bytes(file_info['name'], errors='surrogate_or_strict'))
 
         existing_is_exec = os.stat(src_file, follow_symlinks=False).st_mode & stat.S_IXUSR
-        mode = 0o0755 if existing_is_exec else 0o0644
+        mode = S_IRWXU_RXG_RXO if existing_is_exec else S_IRWU_RG_RO
 
         # ensure symlinks to dirs are not translated to empty dirs
         if os.path.isdir(src_file) and not os.path.islink(src_file):
-            mode = 0o0755
+            mode = S_IRWXU_RXG_RXO
             base_directories.append(src_file)
             os.mkdir(dest_file, mode)
         else:
@@ -1413,11 +1432,12 @@ def find_existing_collections(path_filter, artifacts_manager, namespace_filter=N
     :param path: Collection dirs layout search path.
     :param artifacts_manager: Artifacts manager.
     """
-    if files is None:
-        raise AnsibleError('importlib_resources is not installed and is required')
-
     if path_filter and not is_sequence(path_filter):
         path_filter = [path_filter]
+    if namespace_filter and not is_sequence(namespace_filter):
+        namespace_filter = [namespace_filter]
+    if collection_filter and not is_sequence(collection_filter):
+        collection_filter = [collection_filter]
 
     paths = set()
     for path in files('ansible_collections').glob('*/*/'):
@@ -1439,9 +1459,9 @@ def find_existing_collections(path_filter, artifacts_manager, namespace_filter=N
     for path in paths:
         namespace = path.parent.name
         name = path.name
-        if namespace_filter and namespace != namespace_filter:
+        if namespace_filter and namespace not in namespace_filter:
             continue
-        if collection_filter and name != collection_filter:
+        if collection_filter and name not in collection_filter:
             continue
 
         if dedupe:
@@ -1462,6 +1482,10 @@ def find_existing_collections(path_filter, artifacts_manager, namespace_filter=N
         except ValueError as val_err:
             display.warning(f'{val_err}')
             continue
+
+        if req.fqcn != '.'.join(pathlib.Path(to_text(req.src)).parts[-2:]):
+            display.warning(f"Collection at {to_text(req.src)} documents incorrect FQCN '{req.fqcn}'. Ignoring metadata.")
+            req = Candidate.from_dir_path_implicit(b_collection_path)
 
         display.vvv(
             u"Found installed collection {coll!s} at '{path!s}'".
@@ -1502,6 +1526,7 @@ def install(collection, path, artifacts_manager):  # FIXME: mv to dataclasses?
             artifacts_manager.required_successful_signature_count,
             artifacts_manager.ignore_signature_errors,
         )
+        remove_source_metadata(collection, b_collection_path)
         if (collection.is_online_index_pointer and isinstance(collection.src, GalaxyAPI)):
             write_source_metadata(
                 collection,
@@ -1527,15 +1552,31 @@ def write_source_metadata(collection, b_collection_path, artifacts_manager):
         shutil.rmtree(b_info_dir)
 
     try:
-        os.mkdir(b_info_dir, mode=0o0755)
+        os.mkdir(b_info_dir, mode=S_IRWXU_RXG_RXO)
         with open(b_info_dest, mode='w+b') as fd:
             fd.write(b_yaml_source_data)
-        os.chmod(b_info_dest, 0o0644)
+        os.chmod(b_info_dest, S_IRWU_RG_RO)
     except Exception:
         # Ensure we don't leave the dir behind in case of a failure.
         if os.path.isdir(b_info_dir):
             shutil.rmtree(b_info_dir)
         raise
+
+
+def remove_source_metadata(collection, b_collection_path):
+    pattern = f"{collection.namespace}.{collection.name}-*.info"
+    info_path = os.path.join(
+        b_collection_path,
+        b'../../',
+        to_bytes(pattern, errors='surrogate_or_strict')
+    )
+    if (outdated_info := glob.glob(info_path)):
+        display.vvvv(f"Removing {pattern} metadata from previous installations")
+    for info_dir in outdated_info:
+        try:
+            shutil.rmtree(info_dir)
+        except Exception:
+            pass
 
 
 def verify_artifact_manifest(manifest_file, signatures, keyring, required_signature_count, ignore_signature_errors):
@@ -1561,13 +1602,6 @@ def install_artifact(b_coll_targz_path, b_collection_path, b_temp_path, signatur
     """
     try:
         with tarfile.open(b_coll_targz_path, mode='r') as collection_tar:
-            # Remove this once py3.11 is our controller minimum
-            # Workaround for https://bugs.python.org/issue47231
-            # See _extract_tar_dir
-            collection_tar._ansible_normalized_cache = {
-                m.name.removesuffix(os.path.sep): m for m in collection_tar.getmembers()
-            }  # deprecated: description='TarFile member index' core_version='2.18' python_version='3.11'
-
             # Verify the signature on the MANIFEST.json before extracting anything else
             _extract_tar_file(collection_tar, MANIFEST_FILENAME, b_collection_path, b_temp_path)
 
@@ -1648,21 +1682,17 @@ def install_src(collection, b_collection_path, b_collection_output_path, artifac
 
 def _extract_tar_dir(tar, dirname, b_dest):
     """ Extracts a directory from a collection tar. """
-    dirname = to_native(dirname, errors='surrogate_or_strict').removesuffix(os.path.sep)
+    dirname = to_native(dirname, errors='surrogate_or_strict')
 
     try:
-        tar_member = tar._ansible_normalized_cache[dirname]
+        tar_member = tar.getmember(dirname)
     except KeyError:
         raise AnsibleError("Unable to extract '%s' from collection" % dirname)
 
     b_dir_path = os.path.join(b_dest, to_bytes(dirname, errors='surrogate_or_strict'))
 
     b_parent_path = os.path.dirname(b_dir_path)
-    try:
-        os.makedirs(b_parent_path, mode=0o0755)
-    except OSError as e:
-        if e.errno != errno.EEXIST:
-            raise
+    os.makedirs(b_parent_path, mode=S_IRWXU_RXG_RXO, exist_ok=True)
 
     if tar_member.type == tarfile.SYMTYPE:
         b_link_path = to_bytes(tar_member.linkname, errors='surrogate_or_strict')
@@ -1674,7 +1704,7 @@ def _extract_tar_dir(tar, dirname, b_dest):
 
     else:
         if not os.path.isdir(b_dir_path):
-            os.mkdir(b_dir_path, 0o0755)
+            os.mkdir(b_dir_path, S_IRWXU_RXG_RXO)
 
 
 def _extract_tar_file(tar, filename, b_dest, b_temp_path, expected_hash=None):
@@ -1700,7 +1730,7 @@ def _extract_tar_file(tar, filename, b_dest, b_temp_path, expected_hash=None):
         if not os.path.exists(b_parent_dir):
             # Seems like Galaxy does not validate if all file entries have a corresponding dir ftype entry. This check
             # makes sure we create the parent directory even if it wasn't set in the metadata.
-            os.makedirs(b_parent_dir, mode=0o0755)
+            os.makedirs(b_parent_dir, mode=S_IRWXU_RXG_RXO)
 
         if tar_member.type == tarfile.SYMTYPE:
             b_link_path = to_bytes(tar_member.linkname, errors='surrogate_or_strict')
@@ -1715,9 +1745,9 @@ def _extract_tar_file(tar, filename, b_dest, b_temp_path, expected_hash=None):
 
             # Default to rw-r--r-- and only add execute if the tar file has execute.
             tar_member = tar.getmember(to_native(filename, errors='surrogate_or_strict'))
-            new_mode = 0o644
+            new_mode = S_IRWU_RG_RO
             if stat.S_IMODE(tar_member.mode) & stat.S_IXUSR:
-                new_mode |= 0o0111
+                new_mode |= S_IXANY
 
             os.chmod(b_dest_filepath, new_mode)
 
@@ -1809,15 +1839,19 @@ def _resolve_depenency_map(
         elif not req.specifier.contains(RESOLVELIB_VERSION.vstring):
             raise AnsibleError(f"ansible-galaxy requires {req.name}{req.specifier}")
 
-    if allow_pre_release:
-        pre_release_hint = ''
-    else:
-        pre_release_hint = 'Hint: Pre-releases are not installed by default unless the specific version is given. To enable pre-releases, use --pre.'
+    pre_release_hint = '' if allow_pre_release else (
+        'Hint: Pre-releases hosted on Galaxy or Automation Hub are not '
+        'installed by default unless a specific version is requested. '
+        'To enable pre-releases globally, use --pre.'
+    )
+    requires_ansible_hint = '' if C.COLLECTIONS_ON_ANSIBLE_VERSION_MISMATCH == 'ignore' else (
+        'Hint: To disregard whether the collection supports the current version of '
+        'ansible-core, configure COLLECTIONS_ON_ANSIBLE_VERSION_MISMATCH as "ignore".'
+    )
 
     collection_dep_resolver = build_collection_dependency_resolver(
         galaxy_apis=galaxy_apis,
         concrete_artifacts_manager=concrete_artifacts_manager,
-        user_requirements=requested_requirements,
         preferred_candidates=preferred_candidates,
         with_deps=not no_deps,
         with_pre_releases=allow_pre_release,
@@ -1826,21 +1860,35 @@ def _resolve_depenency_map(
         offline=offline,
     )
     try:
-        return collection_dep_resolver.resolve(
-            requested_requirements,
-            max_rounds=2000000,  # NOTE: same constant pip uses
-        ).mapping
-    except CollectionDependencyResolutionImpossible as dep_exc:
-        conflict_causes = (
-            '* {req.fqcn!s}:{req.ver!s} ({dep_origin!s})'.format(
-                req=req_inf.requirement,
-                dep_origin='direct request'
-                if req_inf.parent is None
-                else 'dependency of {parent!s}'.
-                format(parent=req_inf.parent),
-            )
-            for req_inf in dep_exc.causes
+        return t.cast(
+            dict[str, Candidate],
+            collection_dep_resolver.resolve(
+                requested_requirements,
+                max_rounds=2000000,  # NOTE: same constant pip uses
+            ).mapping,
         )
+    except CollectionDependencyResolutionImpossible as dep_exc:
+        conflict_causes = []
+        for req_inf in dep_exc.causes:
+            if req_inf.requirement.type == "requires_ansible":
+                if req_inf.requirement.has_candidate:
+                    continue
+                collection = str(req_inf.parent)
+                parents = [str(r._parent) for r in req_inf.parent._requirements if r._parent is not None]
+                if not parents:
+                    dep_origin = 'direct request'
+                else:
+                    dep_origin = f'dependency of {", ".join(parents)}'
+            else:
+                collection = str(req_inf.requirement)
+                dep_origin = 'direct request' if req_inf.parent is None else f'dependency of {req_inf.parent!s}'
+
+            cause = f"* {collection} ({dep_origin})"
+            if req_inf.requirement.type == "requires_ansible":
+                cause += f" requires {req_inf.requirement.fqcn!s} {req_inf.requirement.ver!s}"
+
+            conflict_causes.append(cause)
+
         error_msg_lines = list(chain(
             (
                 'Failed to resolve the requested '
@@ -1849,12 +1897,14 @@ def _resolve_depenency_map(
             ),
             conflict_causes,
         ))
+        if any(req_inf.requirement.type == "requires_ansible" for req_inf in dep_exc.causes):
+            dep_exc = None
+            error_msg_lines.append(requires_ansible_hint)
         error_msg_lines.append(pre_release_hint)
         raise AnsibleError('\n'.join(error_msg_lines)) from dep_exc
     except CollectionDependencyInconsistentCandidate as dep_exc:
         parents = [
-            "%s.%s:%s" % (p.namespace, p.name, p.ver)
-            for p in dep_exc.criterion.iter_parent()
+            str(p) for p in dep_exc.criterion.iter_parent()
             if p is not None
         ]
 
@@ -1874,7 +1924,7 @@ def _resolve_depenency_map(
 
         for req in dep_exc.criterion.iter_requirement():
             error_msg_lines.append(
-                '* {req.fqcn!s}:{req.ver!s}'.format(req=req)
+                f'* {req.fqcn!s}:{req.ver!s}'
             )
         error_msg_lines.append(pre_release_hint)
 

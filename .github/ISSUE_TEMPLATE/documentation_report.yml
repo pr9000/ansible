@@ -22,14 +22,16 @@ body:
       Also test if the latest release and devel branch are affected too.
 
 
-      **Tip:** If you are seeking community support, please consider
-      [starting a mailing list thread or chatting in IRC][ML||IRC].
+      **Tip:** If you are seeking community support, please see
+      [Communicating with the Ansible community][communication] to
+      get in touch and ask questions.
 
 
-      [ML||IRC]:
-      https://docs.ansible.com/ansible-core/devel/community/communication.html?utm_medium=github&utm_source=issue_form--documentation_report.yml#mailing-list-information
 
-      [issue search]: ../search?q=is%3Aissue&type=issues
+      [communication]:
+      https://docs.ansible.com/ansible/devel/community/communication.html
+
+      [issue search]: https://github.com/ansible/ansible/search?q=is%3Aissue&type=issues
 
       [submit a pull request]:
       https://docs.ansible.com/ansible-core/devel/community/documentation_contributions.html
@@ -82,20 +84,7 @@ body:
 - type: dropdown
   attributes:
     label: Issue Type
-    description: >
-      Please select the single available option in the drop-down.
-
-      <details>
-        <summary>
-          <em>Why?</em>
-        </summary>
-
-
-        _We will make it easier in the future, once GitHub
-        supports dropdown defaults. Promise!_
-
-      </details>
-    # FIXME: Once GitHub allows defining the default choice, update this
+    description: This is a marker for our automatic bot. Do not change it.
     options:
     - Documentation Report
   validations:
@@ -141,6 +130,8 @@ body:
     label: Configuration
     description: >-
       Paste verbatim output from `ansible-config dump --only-changed -t all` below, under the prompt line.
+      Remember to redact secret values. You can easily filter Galaxy server secrets using grep,
+      for example `ansible-config dump --only-changed -t all | grep -Ev 'token|password|client_secret'`.
       (if using a version older than ansible-core 2.12 you should omit the '-t all')
       Please don't wrap it with triple backticks — your
       whole input will be turned into a code snippet automatically.
@@ -196,7 +187,7 @@ body:
 
 
       [ansibot help]:
-      /ansible/ansibullbot/blob/master/ISSUE_HELP.md#for-issue-submitters
+      /ansible/ansibotmini#ansibotmini
 
 
 - type: checkboxes
@@ -205,7 +196,7 @@ body:
     description: |
       Read the [Ansible Code of Conduct][CoC] first.
 
-      [CoC]: https://docs.ansible.com/ansible/latest/community/code_of_conduct.html?utm_medium=github&utm_source=issue_form--documentation_report.yml
+      [CoC]: https://docs.ansible.com/ansible/devel/community/code_of_conduct.html?utm_medium=github&utm_source=issue_form--documentation_report.yml
     options:
     - label: I agree to follow the Ansible Code of Conduct
       required: true

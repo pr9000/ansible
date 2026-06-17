@@ -1,20 +1,16 @@
 # Copyright: Contributors to the Ansible project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-import sys
+from ansible.utils.display import Display as _Display
 
-HAS_IMPORTLIB_RESOURCES = False
+from importlib.resources import files  # pylint: disable=unused-import
 
-if sys.version_info < (3, 10):
-    try:
-        from importlib_resources import files  # type: ignore[import]  # pylint: disable=unused-import
-    except ImportError:
-        files = None  # type: ignore[assignment]
-    else:
-        HAS_IMPORTLIB_RESOURCES = True
-else:
-    from importlib.resources import files
-    HAS_IMPORTLIB_RESOURCES = True
+HAS_IMPORTLIB_RESOURCES = True
+
+_Display().deprecated(
+    msg="The `ansible.compat.importlib_resources` module is deprecated.",
+    help_text="Use `importlib.resources` from the Python standard library instead.",
+    version="2.23",
+)

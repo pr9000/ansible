@@ -1,9 +1,13 @@
 """Profiles to represent individual test hosts or a user-provided inventory file."""
+
 from __future__ import annotations
 
 import abc
+import base64
 import dataclasses
+import json
 import os
+import pathlib
 import shlex
 import tempfile
 import time
@@ -37,6 +41,7 @@ from .host_configs import (
     VirtualPythonConfig,
     WindowsInventoryConfig,
     WindowsRemoteConfig,
+    PowerShellConfig,
 )
 
 from .core_ci import (
@@ -56,6 +61,12 @@ from .util import (
     InternalError,
     HostConnectionError,
     ANSIBLE_TEST_TARGET_ROOT,
+    WINDOWS_CONNECTION_VARIABLES,
+    ANSIBLE_SOURCE_ROOT,
+    ANSIBLE_LIB_ROOT,
+    ANSIBLE_TEST_ROOT,
+    Architecture,
+    get_powershell_version_map,
 )
 
 from .util_common import (
@@ -90,6 +101,8 @@ from .venv import (
 
 from .ssh import (
     SshConnectionDetail,
+    create_ssh_port_forwards,
+    SshProcess,
 )
 
 from .ansible_util import (
@@ -130,10 +143,10 @@ from .dev.container_probe import (
     check_container_cgroup_status,
 )
 
-TControllerHostConfig = t.TypeVar('TControllerHostConfig', bound=ControllerHostConfig)
-THostConfig = t.TypeVar('THostConfig', bound=HostConfig)
-TPosixConfig = t.TypeVar('TPosixConfig', bound=PosixConfig)
-TRemoteConfig = t.TypeVar('TRemoteConfig', bound=RemoteConfig)
+from .debugging import (
+    DebuggerProfile,
+    DebuggerSettings,
+)
 
 
 class ControlGroupError(ApplicationError):
@@ -193,31 +206,24 @@ class Inventory:
     def write(self, args: CommonConfig, path: str) -> None:
         """Write the given inventory to the specified path on disk."""
 
-        # NOTE: Switching the inventory generation to write JSON would be nice, but is currently not possible due to the use of hard-coded inventory filenames.
-        #       The name `inventory` works for the POSIX integration tests, but `inventory.winrm` and `inventory.networking` will only parse in INI format.
-        #       If tests are updated to use the `INVENTORY_PATH` environment variable, then this could be changed.
-        #       Also, some tests detect the test type by inspecting the suffix on the inventory filename, which would break if it were changed.
-
-        inventory_text = ''
+        inventory_data: dict[str, dict[str, dict[str, dict[str, object]]]] = dict()
 
         for group, hosts in self.host_groups.items():
-            inventory_text += f'[{group}]\n'
+            group_data = inventory_data.setdefault(group, dict())
+            hosts_data = group_data.setdefault('hosts', dict())
 
             for host, variables in hosts.items():
-                kvp = ' '.join(f'{key}="{value}"' for key, value in variables.items())
-                inventory_text += f'{host} {kvp}\n'
-
-            inventory_text += '\n'
+                host_entry = hosts_data.setdefault(host, dict())
+                host_entry.update(variables)
 
         for group, children in (self.extra_groups or {}).items():
-            inventory_text += f'[{group}]\n'
+            group_data = inventory_data.setdefault(group, dict())
+            group_children = group_data.setdefault('children', dict())
 
             for child in children:
-                inventory_text += f'{child}\n'
+                group_children[child] = dict()
 
-            inventory_text += '\n'
-
-        inventory_text = inventory_text.strip()
+        inventory_text = json.dumps(inventory_data, indent=4)
 
         if not args.explain:
             write_text_file(path, inventory_text + '\n')
@@ -225,7 +231,7 @@ class Inventory:
         display.info(f'>>> Inventory\n{inventory_text}', verbosity=3)
 
 
-class HostProfile(t.Generic[THostConfig], metaclass=abc.ABCMeta):
+class HostProfile[THostConfig: HostConfig](metaclass=abc.ABCMeta):
     """Base class for host profiles."""
 
     def __init__(
@@ -233,17 +239,26 @@ class HostProfile(t.Generic[THostConfig], metaclass=abc.ABCMeta):
         *,
         args: EnvironmentConfig,
         config: THostConfig,
-        targets: t.Optional[list[HostConfig]],
+        controller: ControllerHostProfile,
     ) -> None:
         self.args = args
         self.config = config
-        self.controller = bool(targets)
-        self.targets = targets or []
+        self.controller = not controller  # this profile is a controller whenever the `controller` arg was not provided
+        self.targets = args.targets if self.controller else []  # only keep targets if this profile is a controller
+        self.controller_profile = controller if isinstance(self, ControllerProfile) else None
 
         self.state: dict[str, t.Any] = {}
         """State that must be persisted across delegation."""
         self.cache: dict[str, t.Any] = {}
         """Cache that must not be persisted across delegation."""
+
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
+        """The name of the host profile."""
+
+    def pre_provision(self) -> None:
+        """Pre-provision the host profile."""
 
     def provision(self) -> None:
         """Provision the host before delegation."""
@@ -272,8 +287,177 @@ class HostProfile(t.Generic[THostConfig], metaclass=abc.ABCMeta):
         # args will be populated after the instances are restored
         self.cache = {}
 
+    def __str__(self) -> str:
+        return f'{self.__class__.__name__}: {self.name}'
 
-class PosixProfile(HostProfile[TPosixConfig], metaclass=abc.ABCMeta):
+
+class DebuggableProfile[THostConfig: HostConfig](HostProfile[THostConfig], DebuggerProfile, metaclass=abc.ABCMeta):
+    """Base class for profiles remote debugging."""
+
+    __DEBUGGING_PORT_KEY = 'debugging_port'
+    __DEBUGGING_FORWARDER_KEY = 'debugging_forwarder'
+
+    @property
+    def debugger(self) -> DebuggerSettings | None:
+        """The debugger settings for this host if present and enabled, otherwise None."""
+        return self.args.metadata.debugger_settings
+
+    @property
+    def debugging_enabled(self) -> bool:
+        """Returns `True` if debugging is enabled for this profile, otherwise `False`."""
+        if self.controller:
+            return self.args.metadata.debugger_flags.enable
+
+        return self.args.metadata.debugger_flags.ansiballz
+
+    @property
+    def debugger_host(self) -> str:
+        """The debugger host to use."""
+        return 'localhost'
+
+    @property
+    def debugger_port(self) -> int:
+        """The debugger port to use."""
+        return self.state.get(self.__DEBUGGING_PORT_KEY) or self.origin_debugger_port
+
+    @property
+    def debugging_forwarder(self) -> SshProcess | None:
+        """The SSH forwarding process, if enabled."""
+        return self.cache.get(self.__DEBUGGING_FORWARDER_KEY)
+
+    @debugging_forwarder.setter
+    def debugging_forwarder(self, value: SshProcess) -> None:
+        """The SSH forwarding process, if enabled."""
+        self.cache[self.__DEBUGGING_FORWARDER_KEY] = value
+
+    @property
+    def origin_debugger_port(self) -> int:
+        """The debugger port on the origin."""
+        return self.debugger.port
+
+    def enable_debugger_forwarding(self, ssh: SshConnectionDetail) -> None:
+        """Enable debugger port forwarding from the origin."""
+        if not self.debugging_enabled:
+            return
+
+        endpoint = ('localhost', self.origin_debugger_port)
+        forwards = [endpoint]
+
+        self.debugging_forwarder = create_ssh_port_forwards(self.args, ssh, forwards)
+
+        port_forwards = self.debugging_forwarder.collect_port_forwards()
+
+        self.state[self.__DEBUGGING_PORT_KEY] = port = port_forwards[endpoint]
+
+        display.info(f'Remote debugging of {self.name!r} is available on port {port}.', verbosity=1)
+
+    def deprovision(self) -> None:
+        """Deprovision the host after delegation has completed."""
+        super().deprovision()
+
+        if not self.debugging_forwarder:
+            return  # forwarding not in use
+
+        self.debugging_forwarder.terminate()
+
+        display.info(f'Waiting for the {self.name!r} remote debugging SSH port forwarding process to terminate.', verbosity=1)
+
+        self.debugging_forwarder.wait()
+
+    def get_source_mapping(self) -> dict[str, str]:
+        """Get the source mapping from the given metadata."""
+        from . import data_context
+
+        if collection := data_context().content.collection:
+            source_mapping = {
+                f"{self.args.metadata.ansible_test_root}/": f'{ANSIBLE_TEST_ROOT}/',
+                f"{self.args.metadata.ansible_lib_root}/": f'{ANSIBLE_LIB_ROOT}/',
+                f'{self.args.metadata.collection_root}/ansible_collections/': f'{collection.root}/ansible_collections/',
+            }
+        else:
+            ansible_source_root = pathlib.Path(self.args.metadata.ansible_lib_root).parent.parent
+
+            source_mapping = {
+                f"{ansible_source_root}/": f'{ANSIBLE_SOURCE_ROOT}/',
+            }
+
+        source_mapping = {key: value for key, value in source_mapping.items() if key != value}
+
+        return source_mapping
+
+    def activate_debugger(self) -> None:
+        """Activate the debugger after delegation."""
+        if not self.args.metadata.loaded or not self.args.metadata.debugger_flags.self:
+            return
+
+        display.info('Activating remote debugging of ansible-test.', verbosity=1)
+
+        os.environ.update(self.debugger.get_environment_variables(self))
+
+        self.debugger.activate_debugger(self)
+
+        pass  # pylint: disable=unnecessary-pass  # when suspend is True, execution pauses here -- it's also a convenient place to put a breakpoint
+
+    def get_ansiballz_inventory_variables(self) -> dict[str, t.Any]:
+        """
+        Return inventory variables for remote debugging of AnsiballZ modules.
+        When delegating, this function must be called after delegation.
+        """
+        if not self.args.metadata.debugger_flags.ansiballz:
+            return {}
+
+        debug_type = self.debugger.get_debug_type()
+
+        return {
+            f"_ansible_ansiballz_{debug_type}_config": json.dumps(self.get_ansiballz_debugger_config()),
+        }
+
+    def get_ansiballz_environment_variables(self) -> dict[str, t.Any]:
+        """
+        Return environment variables for remote debugging of AnsiballZ modules.
+        When delegating, this function must be called after delegation.
+        """
+        if not self.args.metadata.debugger_flags.ansiballz:
+            return {}
+
+        debug_type = self.debugger.get_debug_type().upper()
+
+        return {
+            f"_ANSIBLE_ANSIBALLZ_{debug_type}_CONFIG": json.dumps(self.get_ansiballz_debugger_config()),
+        }
+
+    def get_ansiballz_debugger_config(self) -> dict[str, t.Any]:
+        """
+        Return config for remote debugging of AnsiballZ modules.
+        When delegating, this function must be called after delegation.
+        """
+        debugger_config = self.debugger.get_ansiballz_config(self)
+
+        display.info(f'>>> Debugger Config ({self.name} AnsiballZ)\n{json.dumps(debugger_config, indent=4)}', verbosity=3)
+
+        return debugger_config
+
+    def get_ansible_cli_environment_variables(self) -> dict[str, t.Any]:
+        """
+        Return environment variables for remote debugging of the Ansible CLI.
+        When delegating, this function must be called after delegation.
+        """
+        if not self.args.metadata.debugger_flags.cli:
+            return {}
+
+        debugger_config = dict(
+            args=self.debugger.get_cli_arguments(self),
+            env=self.debugger.get_environment_variables(self),
+        )
+
+        display.info(f'>>> Debugger Config ({self.name} Ansible CLI)\n{json.dumps(debugger_config, indent=4)}', verbosity=3)
+
+        return dict(
+            ANSIBLE_TEST_DEBUGGER_CONFIG=json.dumps(debugger_config),
+        )
+
+
+class PosixProfile[TPosixConfig: PosixConfig](HostProfile[TPosixConfig], metaclass=abc.ABCMeta):
     """Base class for POSIX host profiles."""
 
     @property
@@ -294,8 +478,47 @@ class PosixProfile(HostProfile[TPosixConfig], metaclass=abc.ABCMeta):
 
         return python
 
+    @property
+    def powershell(self) -> PowerShellConfig:
+        """
+        The PowerShell to use for this profile.
+        """
+        powershell = self.state.get('powershell')
 
-class ControllerHostProfile(PosixProfile[TControllerHostConfig], metaclass=abc.ABCMeta):
+        if not powershell:
+            powershell = self.config.powershell
+
+            self.state['powershell'] = powershell
+
+        return powershell
+
+    def get_python_interpreters(self) -> dict[str, str]:
+        """
+        Get a mapping of Python interpreter versions and paths to use.
+        A target uses a single Python version, but a controller may include additional versions for targets running on the controller.
+        """
+        python_interpreters = {self.python.version: self.python.path}
+        python_interpreters.update({target.python.version: target.python.path for target in self.targets if isinstance(target, ControllerConfig)})
+        python_interpreters = {version: python_interpreters[version] for version in sorted_versions(list(python_interpreters))}
+
+        return python_interpreters
+
+    def get_powershell_versions(self) -> list[str]:
+        """
+        Get a list of PowerShell versions to use.
+        A target uses a single PowerShell version, but a controller may include additional versions for targets running on the controller.
+        """
+        powershell_version_map = get_powershell_version_map()
+
+        powershell_versions = [self.powershell.version] if self.powershell.version else []
+        powershell_versions.extend(target.powershell.version for target in self.targets if isinstance(target, ControllerConfig) and target.powershell.version)
+        powershell_versions = sorted_versions(list(set(powershell_versions)))
+        powershell_versions = [powershell_version_map[version] for version in powershell_versions]
+
+        return powershell_versions
+
+
+class ControllerHostProfile[T: ControllerHostConfig](PosixProfile[T], DebuggableProfile[T], metaclass=abc.ABCMeta):
     """Base class for profiles usable as a controller."""
 
     @abc.abstractmethod
@@ -307,7 +530,7 @@ class ControllerHostProfile(PosixProfile[TControllerHostConfig], metaclass=abc.A
         """Return the working directory for the host."""
 
 
-class SshTargetHostProfile(HostProfile[THostConfig], metaclass=abc.ABCMeta):
+class SshTargetHostProfile[THostConfig: HostConfig](HostProfile[THostConfig], metaclass=abc.ABCMeta):
     """Base class for profiles offering SSH connectivity."""
 
     @abc.abstractmethod
@@ -315,8 +538,13 @@ class SshTargetHostProfile(HostProfile[THostConfig], metaclass=abc.ABCMeta):
         """Return SSH connection(s) for accessing the host as a target from the controller."""
 
 
-class RemoteProfile(SshTargetHostProfile[TRemoteConfig], metaclass=abc.ABCMeta):
+class RemoteProfile[TRemoteConfig: RemoteConfig](SshTargetHostProfile[TRemoteConfig], metaclass=abc.ABCMeta):
     """Base class for remote instance profiles."""
+
+    @property
+    def name(self) -> str:
+        """The name of the host profile."""
+        return self.config.name
 
     @property
     def core_ci_state(self) -> t.Optional[dict[str, str]]:
@@ -328,8 +556,8 @@ class RemoteProfile(SshTargetHostProfile[TRemoteConfig], metaclass=abc.ABCMeta):
         """The saved Ansible Core CI state."""
         self.state['core_ci'] = value
 
-    def provision(self) -> None:
-        """Provision the host before delegation."""
+    def pre_provision(self) -> None:
+        """Pre-provision the host before delegation."""
         self.core_ci = self.create_core_ci(load=True)
         self.core_ci.start()
 
@@ -337,6 +565,8 @@ class RemoteProfile(SshTargetHostProfile[TRemoteConfig], metaclass=abc.ABCMeta):
 
     def deprovision(self) -> None:
         """Deprovision the host after delegation has completed."""
+        super().deprovision()
+
         if self.args.remote_terminate == TerminateMode.ALWAYS or (self.args.remote_terminate == TerminateMode.SUCCESS and self.args.success):
             self.delete_instance()
 
@@ -392,8 +622,18 @@ class RemoteProfile(SshTargetHostProfile[TRemoteConfig], metaclass=abc.ABCMeta):
         )
 
 
-class ControllerProfile(SshTargetHostProfile[ControllerConfig], PosixProfile[ControllerConfig]):
+class ControllerProfile(SshTargetHostProfile[ControllerConfig], PosixProfile[ControllerConfig], DebuggableProfile[ControllerConfig]):
     """Host profile for the controller as a target."""
+
+    @property
+    def name(self) -> str:
+        """The name of the host profile."""
+        return self.controller_profile.name
+
+    @property
+    def debugger_port(self) -> int:
+        """The pydevd port to use."""
+        return self.controller_profile.debugger_port
 
     def get_controller_target_connections(self) -> list[SshConnection]:
         """Return SSH connection(s) for accessing the host as a target from the controller."""
@@ -404,12 +644,13 @@ class ControllerProfile(SshTargetHostProfile[ControllerConfig], PosixProfile[Con
             user='root',
             identity_file=SshKey(self.args).key,
             python_interpreter=self.args.controller_python.path,
+            powershell_interpreter=self.args.controller_powershell.path,
         )
 
         return [SshConnection(self.args, settings)]
 
 
-class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[DockerConfig]):
+class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[DockerConfig], DebuggableProfile[DockerConfig]):
     """Host profile for a docker instance."""
 
     MARKER = 'ansible-test-marker'
@@ -422,6 +663,11 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
         command: str
         command_privileged: bool
         expected_mounts: tuple[CGroupMount, ...]
+
+    @property
+    def name(self) -> str:
+        """The name of the host profile."""
+        return self.config.name
 
     @property
     def container_name(self) -> t.Optional[str]:
@@ -459,7 +705,7 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
             image=self.config.image,
             name=f'ansible-test-{self.label}',
             ports=[22],
-            publish_ports=not self.controller,  # connections to the controller over SSH are not required
+            publish_ports=self.debugging_enabled or not self.controller,  # SSH to the controller is not required unless remote debugging is enabled
             options=init_config.options,
             cleanup=False,
             cmd=self.build_init_command(init_config, init_probe),
@@ -599,7 +845,7 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
                 # The host namespace must be used to permit the container to access the cgroup v1 systemd hierarchy created by Podman.
                 '--cgroupns', 'host',
                 # Mask the host cgroup tmpfs mount to avoid exposing the host cgroup v1 hierarchies (or cgroup v2 hybrid) to the container.
-                # Podman will provide a cgroup v1 systemd hiearchy on top of this.
+                # Podman will provide a cgroup v1 systemd hierarchy on top of this.
                 '--tmpfs', '/sys/fs/cgroup',
             ))
 
@@ -679,6 +925,11 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
         command: t.Optional[str] = None
         command_privileged = False
         expected_mounts: tuple[CGroupMount, ...]
+
+        docker_socket = '/var/run/docker.sock'
+
+        if get_docker_hostname() != 'localhost' or os.path.exists(docker_socket):
+            options.extend(['--volume', f'{docker_socket}:{docker_socket}'])
 
         cgroup_version = get_docker_info(self.args).cgroup_version
 
@@ -806,6 +1057,7 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
           - Avoid hanging indefinitely or for an unreasonably long time.
 
         NOTE: The container must have a POSIX-compliant default shell "sh" with a non-builtin "sleep" command.
+              The "sleep" command is invoked through "env" to avoid using a shell builtin "sleep" (if present).
         """
         command = ''
 
@@ -813,7 +1065,7 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
             command += f'{init_config.command} && '
 
         if sleep or init_config.command_privileged:
-            command += 'sleep 60 ; '
+            command += 'env sleep 60 ; '
 
         if not command:
             return None
@@ -957,7 +1209,8 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
         """Perform out-of-band setup before delegation."""
         bootstrapper = BootstrapDocker(
             controller=self.controller,
-            python_versions=[self.python.version],
+            python_interpreters=self.get_python_interpreters(),
+            powershell_versions=self.get_powershell_versions(),
             ssh_key=SshKey(self.args),
         )
 
@@ -971,8 +1224,13 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
             docker_logs(self.args, self.container_name)
             raise
 
+        if self.debugging_enabled:
+            self.enable_debugger_forwarding(self.get_ssh_connection_detail(HostType.origin))
+
     def deprovision(self) -> None:
         """Deprovision the host after delegation has completed."""
+        super().deprovision()
+
         container_exists = False
 
         if self.container_name:
@@ -1022,10 +1280,10 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
 
             raise HostConnectionError(f'Timeout waiting for {self.config.name} container {self.container_name}.', callback)
 
-    def get_controller_target_connections(self) -> list[SshConnection]:
-        """Return SSH connection(s) for accessing the host as a target from the controller."""
+    def get_ssh_connection_detail(self, host_type: str) -> SshConnectionDetail:
+        """Return SSH connection detail for the specified host type."""
         containers = get_container_database(self.args)
-        access = containers.data[HostType.control]['__test_hosts__'][self.container_name]
+        access = containers.data[host_type]['__test_hosts__'][self.container_name]
 
         host = access.host_ip
         port = dict(access.port_map())[22]
@@ -1037,13 +1295,18 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
             port=port,
             identity_file=SshKey(self.args).key,
             python_interpreter=self.python.path,
+            powershell_interpreter=self.powershell.path,
             # CentOS 6 uses OpenSSH 5.3, making it incompatible with the default configuration of OpenSSH 8.8 and later clients.
             # Since only CentOS 6 is affected, and it is only supported by ansible-core 2.12, support for RSA SHA-1 is simply hard-coded here.
             # A substring is used to allow custom containers to work, not just the one provided with ansible-test.
             enable_rsa_sha1='centos6' in self.config.image,
         )
 
-        return [SshConnection(self.args, settings)]
+        return settings
+
+    def get_controller_target_connections(self) -> list[SshConnection]:
+        """Return SSH connection(s) for accessing the host as a target from the controller."""
+        return [SshConnection(self.args, self.get_ssh_connection_detail(HostType.control))]
 
     def get_origin_controller_connection(self) -> DockerConnection:
         """Return a connection for accessing the host as a controller from the origin."""
@@ -1102,16 +1365,16 @@ class DockerProfile(ControllerHostProfile[DockerConfig], SshTargetHostProfile[Do
         if self.config.seccomp != 'default':
             options.extend(['--security-opt', f'seccomp={self.config.seccomp}'])
 
-        docker_socket = '/var/run/docker.sock'
-
-        if get_docker_hostname() != 'localhost' or os.path.exists(docker_socket):
-            options.extend(['--volume', f'{docker_socket}:{docker_socket}'])
-
         return options
 
 
 class NetworkInventoryProfile(HostProfile[NetworkInventoryConfig]):
     """Host profile for a network inventory."""
+
+    @property
+    def name(self) -> str:
+        """The name of the host profile."""
+        return self.config.path
 
 
 class NetworkRemoteProfile(RemoteProfile[NetworkRemoteConfig]):
@@ -1156,7 +1419,7 @@ class NetworkRemoteProfile(RemoteProfile[NetworkRemoteConfig]):
         env = ansible_environment(self.args)
         module_name = f'{self.config.collection + "." if self.config.collection else ""}{self.config.platform}_command'
 
-        with tempfile.NamedTemporaryFile() as inventory_file:
+        with tempfile.NamedTemporaryFile(suffix='.json') as inventory_file:
             inventory.write(self.args, inventory_file.name)
 
             cmd = ['ansible', '-m', module_name, '-a', 'commands=?', '-i', inventory_file.name, 'all']
@@ -1194,6 +1457,11 @@ class NetworkRemoteProfile(RemoteProfile[NetworkRemoteConfig]):
 class OriginProfile(ControllerHostProfile[OriginConfig]):
     """Host profile for origin."""
 
+    @property
+    def name(self) -> str:
+        """The name of the host profile."""
+        return 'origin'
+
     def get_origin_controller_connection(self) -> LocalConnection:
         """Return a connection for accessing the host as a controller from the origin."""
         return LocalConnection(self.args)
@@ -1203,19 +1471,20 @@ class OriginProfile(ControllerHostProfile[OriginConfig]):
         return os.getcwd()
 
 
-class PosixRemoteProfile(ControllerHostProfile[PosixRemoteConfig], RemoteProfile[PosixRemoteConfig]):
+class PosixRemoteProfile(ControllerHostProfile[PosixRemoteConfig], RemoteProfile[PosixRemoteConfig], DebuggableProfile[PosixRemoteConfig]):
     """Host profile for a POSIX remote instance."""
 
     def wait(self) -> None:
         """Wait for the instance to be ready. Executed before delegation for the controller and after delegation for targets."""
         self.wait_until_ready()
 
+    def setup(self) -> None:
+        """Perform out-of-band setup before delegation."""
+        if self.debugging_enabled:
+            self.enable_debugger_forwarding(self.get_origin_controller_connection().settings)
+
     def configure(self) -> None:
         """Perform in-band configuration. Executed before delegation for the controller and after delegation for targets."""
-        # a target uses a single python version, but a controller may include additional versions for targets running on the controller
-        python_versions = [self.python.version] + [target.python.version for target in self.targets if isinstance(target, ControllerConfig)]
-        python_versions = sorted_versions(list(set(python_versions)))
-
         core_ci = self.wait_for_instance()
         pwd = self.wait_until_ready()
 
@@ -1225,7 +1494,8 @@ class PosixRemoteProfile(ControllerHostProfile[PosixRemoteConfig], RemoteProfile
             controller=self.controller,
             platform=self.config.platform,
             platform_version=self.config.version,
-            python_versions=python_versions,
+            python_interpreters=self.get_python_interpreters(),
+            powershell_versions=self.get_powershell_versions(),
             ssh_key=core_ci.ssh_key,
         )
 
@@ -1246,6 +1516,7 @@ class PosixRemoteProfile(ControllerHostProfile[PosixRemoteConfig], RemoteProfile
             port=core_ci.connection.port,
             identity_file=core_ci.ssh_key.key,
             python_interpreter=self.python.path,
+            powershell_interpreter=self.powershell.path,
         )
 
         if settings.user == 'root':
@@ -1313,6 +1584,11 @@ class PosixRemoteProfile(ControllerHostProfile[PosixRemoteConfig], RemoteProfile
 class PosixSshProfile(SshTargetHostProfile[PosixSshConfig], PosixProfile[PosixSshConfig]):
     """Host profile for a POSIX SSH instance."""
 
+    @property
+    def name(self) -> str:
+        """The name of the host profile."""
+        return self.config.host
+
     def get_controller_target_connections(self) -> list[SshConnection]:
         """Return SSH connection(s) for accessing the host as a target from the controller."""
         settings = SshConnectionDetail(
@@ -1322,6 +1598,7 @@ class PosixSshProfile(SshTargetHostProfile[PosixSshConfig], PosixProfile[PosixSs
             port=self.config.port,
             identity_file=SshKey(self.args).key,
             python_interpreter=self.python.path,
+            powershell_interpreter=self.powershell.path,
         )
 
         return [SshConnection(self.args, settings)]
@@ -1329,6 +1606,11 @@ class PosixSshProfile(SshTargetHostProfile[PosixSshConfig], PosixProfile[PosixSs
 
 class WindowsInventoryProfile(SshTargetHostProfile[WindowsInventoryConfig]):
     """Host profile for a Windows inventory."""
+
+    @property
+    def name(self) -> str:
+        """The name of the host profile."""
+        return self.config.path
 
     def get_controller_target_connections(self) -> list[SshConnection]:
         """Return SSH connection(s) for accessing the host as a target from the controller."""
@@ -1355,9 +1637,63 @@ class WindowsInventoryProfile(SshTargetHostProfile[WindowsInventoryConfig]):
 class WindowsRemoteProfile(RemoteProfile[WindowsRemoteConfig]):
     """Host profile for a Windows remote instance."""
 
+    _ARCHES = {
+        Architecture.X86_64: 'x64',
+        Architecture.AARCH64: 'arm64',
+    }
+    """Mapping of ansible-test architecture to PowerShell release architecture label."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+
+        self.pwsh_interpreter_path: str | None = None
+
     def wait(self) -> None:
         """Wait for the instance to be ready. Executed before delegation for the controller and after delegation for targets."""
         self.wait_until_ready()
+
+    def configure(self) -> None:
+        """Perform in-band configuration. Executed before delegation for the controller and after delegation for targets."""
+        if not self.config.powershell:  # nothing to install
+            return
+
+        if self.config.powershell.version == '5.1':  # built-in version, nothing to install
+            return
+
+        self.wait_for_instance()
+        self.wait_until_ready()
+
+        full_version = get_powershell_version_map()[self.config.powershell.version]
+        arch = self._ARCHES[self.config.arch]
+        download_uri = f'https://github.com/PowerShell/PowerShell/releases/download/v{full_version}/PowerShell-{full_version}-win-{arch}.zip'
+        setup_path = pathlib.Path(ANSIBLE_TEST_TARGET_ROOT) / 'setup'
+        bootstrap_script_path = setup_path / 'bootstrap.ps1'
+        entrypoint_script_path = setup_path / 'entrypoint.ps1'
+
+        setup_manifest = dict(
+            script=bootstrap_script_path.read_text(),
+            path=str(bootstrap_script_path.resolve()),
+            params=dict(
+                PowerShellVersion=self.config.powershell.version,
+                PowerShellDownloadUri=download_uri,
+            ),
+        )
+
+        encoded_manifest = base64.b64encode(json.dumps(setup_manifest).encode()).decode()
+
+        # Passing a command through stdin requires newlines at the end of the input
+        # so it sees it as a complete statement rather than ignoring an incomplete one.
+        setup_entrypoint = entrypoint_script_path.read_text().replace('{{ MANIFEST }}', encoded_manifest).strip() + "\n\n"
+
+        ssh = self.get_controller_target_connections()[0]
+
+        stdout, dummy = ssh.run(
+            command=['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', '-'],
+            data=setup_entrypoint,
+            capture=True,
+        )
+
+        self.pwsh_interpreter_path = stdout.strip()
 
     def get_inventory_variables(self) -> dict[str, t.Optional[t.Union[str, int]]]:
         """Return inventory variables for accessing this host."""
@@ -1365,23 +1701,21 @@ class WindowsRemoteProfile(RemoteProfile[WindowsRemoteConfig]):
         connection = core_ci.connection
 
         variables: dict[str, t.Optional[t.Union[str, int]]] = dict(
-            ansible_connection='winrm',
-            ansible_pipelining='yes',
-            ansible_winrm_server_cert_validation='ignore',
             ansible_host=connection.hostname,
-            ansible_port=connection.port,
+            # ansible_port is intentionally not set using connection.port -- connection-specific variables can set this instead
             ansible_user=connection.username,
-            ansible_password=connection.password,
-            ansible_ssh_private_key_file=core_ci.ssh_key.key,
+            ansible_ssh_private_key_file=core_ci.ssh_key.key,  # required for scenarios which change the connection plugin to SSH
+            ansible_test_connection_password=connection.password,  # required for scenarios which change the connection plugin to require a password
         )
 
-        # HACK: force 2016 to use NTLM + HTTP message encryption
-        if self.config.version == '2016':
-            variables.update(
-                ansible_winrm_transport='ntlm',
-                ansible_winrm_scheme='http',
-                ansible_port='5985',
-            )
+        variables.update(ansible_connection=self.config.connection.split('+')[0])
+        variables.update(WINDOWS_CONNECTION_VARIABLES[self.config.connection])
+
+        if self.pwsh_interpreter_path:
+            variables.update(ansible_pwsh_interpreter=self.pwsh_interpreter_path)
+
+        if variables.pop('use_password'):
+            variables.update(ansible_password=connection.password)
 
         return variables
 
@@ -1396,7 +1730,7 @@ class WindowsRemoteProfile(RemoteProfile[WindowsRemoteConfig]):
         env = ansible_environment(self.args)
         module_name = 'ansible.windows.win_ping'
 
-        with tempfile.NamedTemporaryFile() as inventory_file:
+        with tempfile.NamedTemporaryFile(suffix='.json') as inventory_file:
             inventory.write(self.args, inventory_file.name)
 
             cmd = ['ansible', '-m', module_name, '-i', inventory_file.name, 'all']
@@ -1437,9 +1771,9 @@ def get_config_profile_type_map() -> dict[t.Type[HostConfig], t.Type[HostProfile
 def create_host_profile(
     args: EnvironmentConfig,
     config: HostConfig,
-    controller: bool,
+    controller: ControllerHostProfile | None,
 ) -> HostProfile:
     """Create and return a host profile from the given host configuration."""
     profile_type = get_config_profile_type_map()[type(config)]
-    profile = profile_type(args=args, config=config, targets=args.targets if controller else None)
+    profile = profile_type(args=args, config=config, controller=controller)
     return profile

@@ -1,8 +1,7 @@
 # (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
 # (c) 2017 Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 DOCUMENTATION = """
     name: fileglob
@@ -12,6 +11,7 @@ DOCUMENTATION = """
     description:
         - Matches all files in a single directory, non-recursively, that match a pattern.
           It calls Python's "glob" library.
+    positional: _terms
     options:
       _terms:
         description: path(s) of files to read

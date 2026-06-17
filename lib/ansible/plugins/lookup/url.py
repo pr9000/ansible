@@ -1,8 +1,7 @@
 # (c) 2015, Brian Coca <bcoca@ansible.com>
 # (c) 2012-17 Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 DOCUMENTATION = """
 name: url
@@ -11,6 +10,7 @@ version_added: "1.9"
 short_description: return contents from URL
 description:
     - Returns the content of the URL requested to be used as data in play.
+positional: _terms
 options:
   _terms:
     description: urls to query
@@ -81,14 +81,13 @@ options:
     version_added: "2.10"
     default: False
     vars:
-        - name: ansible_lookup_url_agent
+        - name: ansible_lookup_url_force_basic_auth
     env:
-        - name: ANSIBLE_LOOKUP_URL_AGENT
+        - name: ANSIBLE_LOOKUP_URL_FORCE_BASIC_AUTH
     ini:
         - section: url_lookup
-          key: agent
+          key: force_basic_auth
   follow_redirects:
-    description: String of urllib2, all/yes, safe, none to determine how redirects are followed, see RedirectHandlerFactory for more information
     type: string
     version_added: "2.10"
     default: 'urllib2'
@@ -166,7 +165,7 @@ options:
     description:
       - SSL/TLS Ciphers to use for the request
       - 'When a list is provided, all ciphers are joined in order with C(:)'
-      - See the L(OpenSSL Cipher List Format,https://www.openssl.org/docs/manmaster/man1/openssl-ciphers.html#CIPHER-LIST-FORMAT)
+      - See the L(OpenSSL Cipher List Format,https://docs.openssl.org/master/man1/openssl-ciphers/#cipher-list-format)
         for more details.
       - The available ciphers is dependent on the Python and OpenSSL/LibreSSL versions
     type: list
@@ -179,6 +178,8 @@ options:
     ini:
         - section: url_lookup
           key: ciphers
+extends_documentation_fragment:
+  - url.url_redirect
 """
 
 EXAMPLES = """

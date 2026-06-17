@@ -42,12 +42,25 @@ from packaging.version import Version, InvalidVersion
 # region CLI Framework
 
 
-C = t.TypeVar("C", bound=t.Callable[[...], None])
-
-
 def path_to_str(value: t.Any) -> str:
     """Return the given value converted to a string suitable for use as a command line argument."""
     return f"{value}/" if isinstance(value, pathlib.Path) and value.is_dir() else str(value)
+
+
+@t.overload
+def run(*args: t.Any, env: dict[str, t.Any] | None, cwd: pathlib.Path | str, capture_output: t.Literal[True]) -> CompletedProcess: ...
+
+
+@t.overload
+def run(*args: t.Any, env: dict[str, t.Any] | None, cwd: pathlib.Path | str, capture_output: t.Literal[False]) -> None: ...
+
+
+@t.overload
+def run(*args: t.Any, env: dict[str, t.Any] | None, cwd: pathlib.Path | str, capture_output: bool) -> CompletedProcess | None: ...
+
+
+@t.overload
+def run(*args: t.Any, env: dict[str, t.Any] | None, cwd: pathlib.Path | str) -> None: ...
 
 
 def run(
@@ -55,7 +68,7 @@ def run(
     env: dict[str, t.Any] | None,
     cwd: pathlib.Path | str,
     capture_output: bool = False,
-) -> CompletedProcess:
+) -> CompletedProcess | None:
     """Run the specified command."""
     args = [arg.relative_to(cwd) if isinstance(arg, pathlib.Path) else arg for arg in args]
 
@@ -76,16 +89,18 @@ def run(
             stderr=ex.stderr,
         ) from None
 
+    if not capture_output:
+        return None
+
     # improve type hinting
     return CompletedProcess(
-        args=str_args,
         stdout=p.stdout,
         stderr=p.stderr,
     )
 
 
 @contextlib.contextmanager
-def suppress_when(error_as_warning: bool) -> None:
+def suppress_when(error_as_warning: bool) -> t.Generator[None, None, None]:
     """Conditionally convert an ApplicationError in the provided context to a warning."""
     if error_as_warning:
         try:
@@ -122,9 +137,8 @@ class CalledProcessError(Exception):
 class CompletedProcess:
     """Results from a completed process."""
 
-    args: tuple[str, ...]
-    stdout: str | None
-    stderr: str | None
+    stdout: str
+    stderr: str
 
 
 class Display:
@@ -167,16 +181,16 @@ class CommandFramework:
     """
 
     def __init__(self, **kwargs: dict[str, t.Any] | None) -> None:
-        self.commands: list[C] = []
+        self.commands: list[t.Callable[..., None]] = []
         self.arguments = kwargs
         self.parsed_arguments: argparse.Namespace | None = None
 
-    def __call__(self, func: C) -> C:
+    def __call__[T: t.Callable[..., None]](self, func: T) -> T:
         """Register the decorated function as a CLI command."""
         self.commands.append(func)
         return func
 
-    def run(self, *args: C, **kwargs) -> None:
+    def run(self, *args: t.Callable[..., None], **kwargs) -> None:
         """Run the specified command(s), using any provided internal args."""
         for arg in args:
             self._run(arg, **kwargs)
@@ -202,6 +216,9 @@ class CommandFramework:
 
                 arguments = arguments.copy()
                 exclusive = arguments.pop("exclusive", None)
+
+                # noinspection PyProtectedMember, PyUnresolvedReferences
+                command_parser: argparse._ActionsContainer
 
                 if exclusive:
                     if exclusive not in exclusive_groups:
@@ -234,7 +251,7 @@ class CommandFramework:
             display.fatal(ex)
             sys.exit(1)
 
-    def _run(self, func: C, **kwargs) -> None:
+    def _run(self, func: t.Callable[..., None], **kwargs) -> None:
         """Run the specified command, using any provided internal args."""
         signature = inspect.signature(func)
         func_args = {name: getattr(self.parsed_arguments, name) for name in signature.parameters if hasattr(self.parsed_arguments, name)}
@@ -253,7 +270,7 @@ class CommandFramework:
         display.show(f"<== {label}", color=Display.BLUE)
 
     @staticmethod
-    def _format_command_name(func: C) -> str:
+    def _format_command_name(func: t.Callable[..., None]) -> str:
         """Return the friendly name of the given command."""
         return func.__name__.replace("_", "-")
 
@@ -330,14 +347,6 @@ class ReleaseArtifact:
     digest_algorithm: str
 
 
-@dataclasses.dataclass(frozen=True)
-class ReleaseAnnouncement:
-    """Contents of a release announcement."""
-
-    subject: str
-    body: str
-
-
 # endregion
 # region Utilities
 
@@ -350,6 +359,8 @@ ANSIBLE_DIR = ANSIBLE_LIB_DIR / "ansible"
 ANSIBLE_BIN_DIR = CHECKOUT_DIR / "bin"
 ANSIBLE_RELEASE_FILE = ANSIBLE_DIR / "release.py"
 ANSIBLE_REQUIREMENTS_FILE = CHECKOUT_DIR / "requirements.txt"
+ANSIBLE_CHANGELOG_REQUIREMENTS_FILE = CHECKOUT_DIR / "test/lib/ansible_test/_data/requirements/sanity.changelog.txt"
+ANSIBLE_PYPROJECT_TOML_FILE = CHECKOUT_DIR / "pyproject.toml"
 
 DIST_DIR = CHECKOUT_DIR / "dist"
 VENV_DIR = DIST_DIR / ".venv" / "release"
@@ -441,7 +452,19 @@ class VersionMode(enum.Enum):
         raise NotImplementedError(self)
 
 
-def git(*args: t.Any, capture_output: bool = False) -> CompletedProcess:
+@t.overload
+def git(*args: t.Any, capture_output: t.Literal[True]) -> CompletedProcess: ...
+
+
+@t.overload
+def git(*args: t.Any, capture_output: t.Literal[False]) -> None: ...
+
+
+@t.overload
+def git(*args: t.Any) -> None: ...
+
+
+def git(*args: t.Any, capture_output: bool = False) -> CompletedProcess | None:
     """Run the specified git command."""
     return run("git", *args, env=None, cwd=CHECKOUT_DIR, capture_output=capture_output)
 
@@ -534,10 +557,6 @@ def create_pull_request_body(title: str) -> str:
 ##### ISSUE TYPE
 
 Feature Pull Request
-
-##### COMPONENT NAME
-
-ansible
 """
 
     return body.lstrip()
@@ -629,23 +648,8 @@ def get_git_state(version: Version, allow_stale: bool) -> GitState:
 
 
 @functools.cache
-def ensure_venv() -> dict[str, str]:
+def ensure_venv(requirements_content: str) -> dict[str, t.Any]:
     """Ensure the release venv is ready and return the env vars needed to use it."""
-
-    # TODO: consider freezing the ansible and release requirements along with their dependencies
-
-    ansible_requirements = ANSIBLE_REQUIREMENTS_FILE.read_text()
-
-    release_requirements = """
-build
-twine
-"""
-
-    requirements_file = CHECKOUT_DIR / "test/sanity/code-smell/package-data.requirements.txt"
-    requirements_content = requirements_file.read_text()
-    requirements_content += ansible_requirements
-    requirements_content += release_requirements
-
     requirements_hash = hashlib.sha256(requirements_content.encode()).hexdigest()[:8]
 
     python_version = ".".join(map(str, sys.version_info[:2]))
@@ -676,6 +680,35 @@ twine
         venv_marker_file.touch()
 
     return env
+
+
+def get_pypi_project(repository: str, project: str, version: Version | None = None) -> dict[str, t.Any]:
+    """Return the project JSON from PyPI for the specified repository, project and version (optional)."""
+    endpoint = PYPI_ENDPOINTS[repository]
+
+    if version:
+        url = f"{endpoint}/{project}/{version}/json"
+    else:
+        url = f"{endpoint}/{project}/json"
+
+    opener = urllib.request.build_opener()
+    response: http.client.HTTPResponse
+
+    try:
+        with opener.open(url) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as ex:
+        if version:
+            target = f'{project!r} version {version}'
+        else:
+            target = f'{project!r}'
+
+        if ex.status == http.HTTPStatus.NOT_FOUND:
+            raise ApplicationError(f"Could not find {target} on PyPI.") from None
+
+        raise RuntimeError(f"Failed to get {target} from PyPI.") from ex
+
+    return data
 
 
 def get_ansible_version(version: str | None = None, /, commit: str | None = None, mode: VersionMode = VersionMode.DEFAULT) -> Version:
@@ -721,12 +754,17 @@ def get_next_version(version: Version, /, final: bool = False, pre: str | None =
             pre = ""
         elif not pre and version.pre is not None:
             pre = f"{version.pre[0]}{version.pre[1]}"
+        elif not pre:
+            pre = "b1"  # when there is no existing pre and none specified, advance to b1
+
     elif version.is_postrelease:
         # The next version of a post release is the next pre-release *or* micro release component.
         if final:
             pre = ""
         elif not pre and version.pre is not None:
             pre = f"{version.pre[0]}{version.pre[1] + 1}"
+        elif not pre:
+            pre = "rc1"  # when there is no existing pre and none specified, advance to rc1
 
         if version.pre is None:
             micro = version.micro + 1
@@ -765,6 +803,38 @@ def set_ansible_version(current_version: Version, requested_version: Version) ->
         raise RuntimeError("Failed to set the ansible-core version.")
 
     ANSIBLE_RELEASE_FILE.write_text(updated)
+
+
+def get_latest_setuptools_version() -> Version:
+    """Return the latest setuptools version found on PyPI."""
+    data = get_pypi_project('pypi', 'setuptools')
+    version = Version(data['info']['version'])
+
+    return version
+
+
+def set_setuptools_upper_bound(requested_version: Version) -> None:
+    """Set the upper bound on setuptools in pyproject.toml."""
+    current = ANSIBLE_PYPROJECT_TOML_FILE.read_text()
+    pattern = re.compile(r'^(?P<begin>requires = \["setuptools >= )(?P<lower>[^,]+)(?P<middle>, <= )(?P<upper>[^"]+)(?P<end>".*)$', re.MULTILINE)
+    match = pattern.search(current)
+
+    if not match:
+        raise ApplicationError(f"Unable to find the 'requires' entry in: {ANSIBLE_PYPROJECT_TOML_FILE.relative_to(CHECKOUT_DIR)}")
+
+    current_version = Version(match.group('upper'))
+
+    if requested_version == current_version:
+        return
+
+    display.show(f"Updating setuptools upper bound from {current_version} to {requested_version} ...")
+
+    updated = pattern.sub(fr'\g<begin>\g<lower>\g<middle>{requested_version}\g<end>', current)
+
+    if current == updated:
+        raise RuntimeError("Failed to set the setuptools upper bound.")
+
+    ANSIBLE_PYPROJECT_TOML_FILE.write_text(updated)
 
 
 def create_reproducible_sdist(original_path: pathlib.Path, output_path: pathlib.Path, mtime: int) -> None:
@@ -826,7 +896,7 @@ def test_built_artifact(path: pathlib.Path) -> None:
 
 def get_sdist_path(version: Version, dist_dir: pathlib.Path = DIST_DIR) -> pathlib.Path:
     """Return the path to the sdist file."""
-    return dist_dir / f"ansible-core-{version}.tar.gz"
+    return dist_dir / f"ansible_core-{version}.tar.gz"
 
 
 def get_wheel_path(version: Version, dist_dir: pathlib.Path = DIST_DIR) -> pathlib.Path:
@@ -836,28 +906,15 @@ def get_wheel_path(version: Version, dist_dir: pathlib.Path = DIST_DIR) -> pathl
 
 def calculate_digest(path: pathlib.Path) -> str:
     """Return the digest for the specified file."""
-    # TODO: use hashlib.file_digest once Python 3.11 is the minimum supported version
-    return hashlib.new(DIGEST_ALGORITHM, path.read_bytes()).hexdigest()
+    with open(path, "rb") as f:
+        digest = hashlib.file_digest(f, DIGEST_ALGORITHM)
+    return digest.hexdigest()
 
 
 @functools.cache
 def get_release_artifact_details(repository: str, version: Version, validate: bool) -> list[ReleaseArtifact]:
     """Return information about the release artifacts hosted on PyPI."""
-    endpoint = PYPI_ENDPOINTS[repository]
-    url = f"{endpoint}/ansible-core/{version}/json"
-
-    opener = urllib.request.build_opener()
-    response: http.client.HTTPResponse
-
-    try:
-        with opener.open(url) as response:
-            data = json.load(response)
-    except urllib.error.HTTPError as ex:
-        if ex.status == http.HTTPStatus.NOT_FOUND:
-            raise ApplicationError(f"Version {version} not found on PyPI.") from None
-
-        raise RuntimeError(f"Failed to get {version} from PyPI: {ex}") from ex
-
+    data = get_pypi_project(repository, 'ansible-core', version)
     artifacts = [describe_release_artifact(version, item, validate) for item in data["urls"]]
 
     expected_artifact_types = {"bdist_wheel", "sdist"}
@@ -873,7 +930,7 @@ def describe_release_artifact(version: Version, item: dict[str, t.Any], validate
     """Return release artifact details extracted from the given PyPI data."""
     package_type = item["packagetype"]
 
-    # The artifact URL is documented as stable, so is safe to put in release notes and announcements.
+    # The artifact URL is documented as stable, so is safe to put in release notes.
     # See: https://github.com/pypi/warehouse/blame/c95be4a1055f4b36a8852715eb80318c81fc00ca/docs/api-reference/integration-guide.rst#L86-L90
     url = item["url"]
 
@@ -943,7 +1000,7 @@ def create_github_release_notes(upstream: Remote, repository: str, version: Vers
     variables = dict(
         version=version,
         releases=get_release_artifact_details(repository, version, validate),
-        changelog=f"https://github.com/{upstream.user}/{upstream.repo}/blob/v{ version }/changelogs/CHANGELOG-v{ version.major }.{ version.minor }.rst",
+        changelog=f"https://github.com/{upstream.user}/{upstream.repo}/blob/v{version}/changelogs/CHANGELOG-v{version.major}.{version.minor}.rst",
     )
 
     release_notes = template.render(**variables).strip()
@@ -951,57 +1008,9 @@ def create_github_release_notes(upstream: Remote, repository: str, version: Vers
     return release_notes
 
 
-def create_release_announcement(upstream: Remote, repository: str, version: Version, validate: bool) -> ReleaseAnnouncement:
-    """Create and return a release announcement message."""
-    env = create_template_environment()
-    subject_template = env.from_string(RELEASE_ANNOUNCEMENT_SUBJECT_TEMPLATE)
-    body_template = env.from_string(RELEASE_ANNOUNCEMENT_BODY_TEMPLATE)
-
-    today = datetime.datetime.now(tz=datetime.timezone.utc).date()
-
-    variables = dict(
-        version=version,
-        info=dict(
-            name="ansible-core",
-            short=f"{version.major}.{version.minor}",
-            releases=get_release_artifact_details(repository, version, validate),
-        ),
-        next_rc=get_next_release_date(datetime.date(2021, 8, 9), 28, today),
-        next_ga=get_next_release_date(datetime.date(2021, 8, 16), 28, today),
-        rc=version.pre and version.pre[0] == "rc",
-        beta=version.pre and version.pre[0] == "b",
-        alpha=version.pre and version.pre[0] == "a",
-        major=version.micro == 0,
-        upstream=upstream,
-    )
-
-    if version.pre and version.pre[0] in ("a", "b"):
-        display.warning("The release announcement template does not populate the date for the next release.")
-
-    subject = subject_template.render(**variables).strip()
-    body = body_template.render(**variables).strip()
-
-    message = ReleaseAnnouncement(
-        subject=subject,
-        body=body,
-    )
-
-    return message
-
-
 # endregion
 # region Templates
 
-
-FINAL_RELEASE_ANNOUNCEMENT_RECIPIENTS = [
-    "ansible-announce@googlegroups.com",
-    "ansible-project@googlegroups.com",
-    "ansible-devel@googlegroups.com",
-]
-
-PRE_RELEASE_ANNOUNCEMENT_RECIPIENTS = [
-    "ansible-devel@googlegroups.com",
-]
 
 GITHUB_RELEASE_NOTES_TEMPLATE = """
 # Changelog
@@ -1011,88 +1020,15 @@ See the [full changelog]({{ changelog }}) for the changes included in this relea
 # Release Artifacts
 
 {%- for release in releases %}
-* {{ release.package_label }}: [{{ release.url|basename }}]({{ release.url }}) - {{ release.size }} bytes
+* {{ release.package_label }}: [{{ release.url|basename }}]({{ release.url }}) - &zwnj;{{ release.size }} bytes
   * {{ release.digest }} ({{ release.digest_algorithm }})
 {%- endfor %}
 """
 
-# These release templates were adapted from sivel's release announcement script.
-# See: https://gist.github.com/sivel/937bc2862a9677d8db875f3b10744d8c
-
-RELEASE_ANNOUNCEMENT_SUBJECT_TEMPLATE = """
-New release{% if rc %} candidate{% elif beta %} beta{% elif alpha %} alpha{% endif %}: {{ info.name }} {{ version }}
-"""
-
-# NOTE: Gmail will automatically wrap the plain text version when sending.
-#       There's no need to perform wrapping ahead of time for normal sentences.
-#       However, lines with special formatting should be kept short to avoid unwanted wrapping.
-RELEASE_ANNOUNCEMENT_BODY_TEMPLATE = """
-Hi all- we're happy to announce the{{ " " }}
-{%- if rc -%}
-following release candidate
-{%- elif beta -%}
-beta release of
-{%- elif alpha -%}
-alpha release of
-{%- else -%}
-general release of
-{%- endif -%}:
-
-{{ info.name }} {{ version }}
-
-
-How to get it
--------------
-
-$ python3 -m pip install --user {{ info.name }}=={{ version }}
-
-The release artifacts can be found here:
-{% for release in info.releases %}
-# {{ release.package_label }}: {{ release.size }} bytes
-# {{ release.digest_algorithm }}: {{ release.digest }}
-{{ release.url }}
-{%- endfor %}
-
-
-What's new
-----------
-
-{% if major %}
-This release is a major release.
-{%- else -%}
-This release is a maintenance release containing numerous bugfixes.
-{% endif %}
-The full changelog can be found here:
-
-https://github.com/{{ upstream.user }}/{{ upstream.repo }}/blob/v{{ version }}/changelogs/CHANGELOG-v{{ info.short }}.rst
-
-
-Schedule for future releases
-----------------------------
-{% if rc %}
-The release candidate will become a general availability release on {{ next_ga.strftime('%-d %B %Y') }}.
-{% elif beta %}
-Subject to the need for additional beta releases, the first release candidate is scheduled for X.
-{% elif alpha %}
-Subject to the need for additional alpha releases, the first release beta is scheduled for X.
-{% else %}
-The next release candidate is planned to be released on {{ next_rc.strftime('%-d %B %Y') }}. The next general availability release will be one week after.
-{% endif %}
-
-Porting help
-------------
-
-If you discover any errors or if any of your working playbooks break when you upgrade, please use the following link to report the regression:
-
-https://github.com/{{ upstream.user }}/{{ upstream.repo }}/issues/new/choose
-
-In your issue, be sure to mention the version that works and the one that doesn't.
-
-Thanks!
-"""
 
 # endregion
 # region Commands
+
 
 command = CommandFramework(
     repository=dict(metavar="REPO", choices=tuple(PYPI_ENDPOINTS), default="pypi", help="PyPI repository to use: %(choices)s [%(default)s]"),
@@ -1100,9 +1036,9 @@ command = CommandFramework(
     pre=dict(exclusive="version", help="increment version to the specified pre-release (aN, bN, rcN)"),
     final=dict(exclusive="version", action="store_true", help="increment version to the next final release"),
     commit=dict(help="commit to tag"),
-    mailto=dict(name="--no-mailto", action="store_false", help="write announcement to console instead of using a mailto: link"),
     validate=dict(name="--no-validate", action="store_false", help="disable validation of PyPI artifacts against local ones"),
     prompt=dict(name="--no-prompt", action="store_false", help="disable interactive prompt before publishing with twine"),
+    setuptools=dict(name='--no-setuptools', action="store_false", help="disable updating setuptools upper bound"),
     allow_tag=dict(action="store_true", help="allow an existing release tag (for testing)"),
     allow_stale=dict(action="store_true", help="allow a stale checkout (for testing)"),
     allow_dirty=dict(action="store_true", help="allow untracked files and files with changes (for testing)"),
@@ -1124,9 +1060,8 @@ Releases must be performed using an up-to-date checkout of a fork of the Ansible
 4. Run the `complete` command [2], then:
    a. Submit the GitHub release opened in the browser.
    b. Submit the PR opened in the browser.
-   c. Send the release announcement opened in your browser.
-   d. Wait for CI to pass.
-   e. Merge the PR.
+   c. Wait for CI to pass.
+   d. Merge the PR.
 
 [1] Use the `--final`, `--pre` or `--version` option for control over the version.
 [2] During the `publish` step, `twine` may prompt for credentials.
@@ -1159,10 +1094,11 @@ def check_state(allow_stale: bool = False) -> None:
 
 # noinspection PyUnusedLocal
 @command
-def prepare(final: bool = False, pre: str | None = None, version: str | None = None) -> None:
+def prepare(final: bool = False, pre: str | None = None, version: str | None = None, setuptools: bool | None = None) -> None:
     """Prepare a release."""
     command.run(
         update_version,
+        update_setuptools,
         check_state,
         generate_summary,
         generate_changelog,
@@ -1181,6 +1117,16 @@ def update_version(final: bool = False, pre: str | None = None, version: str | N
         requested_version = get_next_version(current_version, final=final, pre=pre)
 
     set_ansible_version(current_version, requested_version)
+
+
+@command
+def update_setuptools(setuptools: bool) -> None:
+    """Update the setuptools upper bound in pyproject.toml."""
+    if not setuptools:
+        return
+
+    requested_version = get_latest_setuptools_version()
+    set_setuptools_upper_bound(requested_version)
 
 
 @command
@@ -1203,7 +1149,12 @@ release_summary: |
 @command
 def generate_changelog() -> None:
     """Generate the changelog and validate the results."""
-    env = ensure_venv()
+    changelog_requirements = (
+        ANSIBLE_CHANGELOG_REQUIREMENTS_FILE.read_text()
+        + ANSIBLE_REQUIREMENTS_FILE.read_text()  # TODO: consider pinning the ansible requirements and dependencies
+    )
+
+    env = ensure_venv(changelog_requirements)
     env.update(
         PATH=os.pathsep.join((str(ANSIBLE_BIN_DIR), env["PATH"])),
         PYTHONPATH=ANSIBLE_LIB_DIR,
@@ -1229,6 +1180,7 @@ def create_release_pr(allow_stale: bool = False) -> None:
         add=(
             CHANGELOGS_DIR,
             ANSIBLE_RELEASE_FILE,
+            ANSIBLE_PYPROJECT_TOML_FILE,
         ),
         allow_stale=allow_stale,
     )
@@ -1238,7 +1190,7 @@ def create_release_pr(allow_stale: bool = False) -> None:
 
 # noinspection PyUnusedLocal
 @command
-def complete(repository: str, mailto: bool = True, allow_dirty: bool = False) -> None:
+def complete(repository: str, allow_dirty: bool = False) -> None:
     """Complete a release after the prepared changes have been merged."""
     command.run(
         check_state,
@@ -1248,7 +1200,6 @@ def complete(repository: str, mailto: bool = True, allow_dirty: bool = False) ->
         tag_release,
         post_version,
         create_post_pr,
-        release_announcement,
     )
 
 
@@ -1256,7 +1207,12 @@ def complete(repository: str, mailto: bool = True, allow_dirty: bool = False) ->
 def build(allow_dirty: bool = False) -> None:
     """Build the sdist and wheel."""
     version = get_ansible_version(mode=VersionMode.ALLOW_DEV_POST)
-    env = ensure_venv()
+
+    # TODO: consider pinning the build requirement and its dependencies
+    build_requirements = """
+build
+"""
+    env = ensure_venv(build_requirements)
 
     dirty = git("status", "--porcelain", "--untracked-files=all", capture_output=True).stdout.strip().splitlines()
 
@@ -1274,13 +1230,13 @@ def build(allow_dirty: bool = False) -> None:
         commit_time = int(git("show", "-s", "--format=%ct", capture_output=True).stdout)
 
         env.update(
-            SOURCE_DATE_EPOCH=str(commit_time),
+            SOURCE_DATE_EPOCH=commit_time,
         )
 
         git("worktree", "add", "-d", temp_dir)
 
         try:
-            run("python", "-m", "build", "--config-setting=--build-manpages", env=env, cwd=temp_dir)
+            run("python", "-m", "build", env=env, cwd=temp_dir)
 
             create_reproducible_sdist(get_sdist_path(version, dist_dir), sdist_file, commit_time)
             get_wheel_path(version, dist_dir).rename(wheel_file)
@@ -1312,21 +1268,13 @@ def test_sdist() -> None:
             except FileNotFoundError:
                 raise ApplicationError(f"Missing sdist: {sdist_file.relative_to(CHECKOUT_DIR)}") from None
 
-            sdist.extractall(temp_dir)
-
-        man1_dir = temp_dir / sdist_file.with_suffix("").with_suffix("").name / "docs" / "man" / "man1"
-        man1_pages = sorted(man1_dir.glob("*.1"))
-
-        if not man1_pages:
-            raise ApplicationError(f"No man pages found in the sdist at: {man1_dir.relative_to(temp_dir)}")
+            sdist.extractall(temp_dir, filter='data')
 
         pyc_glob = "*.pyc*"
         pyc_files = sorted(path.relative_to(temp_dir) for path in temp_dir.rglob(pyc_glob))
 
         if pyc_files:
             raise ApplicationError(f"Found {len(pyc_files)} '{pyc_glob}' file(s): {', '.join(map(str, pyc_files))}")
-
-        display.show(f"Found man1 pages: {', '.join([path.name for path in man1_pages])}")
 
     test_built_artifact(sdist_file)
 
@@ -1357,7 +1305,12 @@ def publish(repository: str, prompt: bool = True) -> None:
     version = get_ansible_version()
     sdist_file = get_sdist_path(version)
     wheel_file = get_wheel_path(version)
-    env = ensure_venv()
+
+    # TODO: consider pinning the twine requirement and its dependencies
+    publish_requirements = """
+twine
+"""
+    env = ensure_venv(publish_requirements)
 
     if prompt:
         try:
@@ -1431,35 +1384,6 @@ def create_post_pr(allow_stale: bool = False) -> None:
     )
 
     create_pull_request(pr)
-
-
-@command
-def release_announcement(repository: str, version: str | None = None, mailto: bool = True, validate: bool = True) -> None:
-    """Generate a release announcement for the current or specified version."""
-    parsed_version = get_ansible_version(version, mode=VersionMode.STRIP_POST)
-    upstream = get_remotes().upstream
-    message = create_release_announcement(upstream, repository, parsed_version, validate)
-    recipient_list = PRE_RELEASE_ANNOUNCEMENT_RECIPIENTS if parsed_version.is_prerelease else FINAL_RELEASE_ANNOUNCEMENT_RECIPIENTS
-    recipients = ", ".join(recipient_list)
-
-    if mailto:
-        to = urllib.parse.quote(recipients)
-
-        params = dict(
-            subject=message.subject,
-            body=message.body,
-        )
-
-        query_string = urllib.parse.urlencode(params)
-        url = f"mailto:{to}?{query_string}"
-
-        display.show("Opening email client through default web browser ...")
-        webbrowser.open(url)
-    else:
-        print(f"TO: {recipients}")
-        print(f"SUBJECT: {message.subject}")
-        print()
-        print(message.body)
 
 
 # endregion

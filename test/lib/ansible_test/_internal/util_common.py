@@ -1,8 +1,10 @@
 """Common utility code that depends on CommonConfig."""
+
 from __future__ import annotations
 
 import collections.abc as c
 import contextlib
+import functools
 import json
 import os
 import re
@@ -30,6 +32,7 @@ from .util import (
     MODE_FILE,
     OutputStream,
     PYTHON_PATHS,
+    POWERSHELL_PATHS,
     raw_command,
     ANSIBLE_TEST_DATA_ROOT,
     ANSIBLE_TEST_TARGET_ROOT,
@@ -58,6 +61,7 @@ from .provider.layout import (
 from .host_configs import (
     PythonConfig,
     VirtualPythonConfig,
+    PowerShellConfig,
 )
 
 CHECK_YAML_VERSIONS: dict[str, t.Any] = {}
@@ -65,6 +69,7 @@ CHECK_YAML_VERSIONS: dict[str, t.Any] = {}
 
 class ExitHandler:
     """Simple exit handler implementation."""
+
     _callbacks: list[tuple[t.Callable, tuple[t.Any, ...], dict[str, t.Any]]] = []
 
     @staticmethod
@@ -175,6 +180,7 @@ class CommonConfig:
         self.debug: bool = args.debug
         self.truncate: int = args.truncate
         self.redact: bool = args.redact
+        self.display_traceback: str = args.display_traceback
 
         self.display_stderr: bool = False
 
@@ -269,7 +275,10 @@ def named_temporary_file(args: CommonConfig, prefix: str, suffix: str, directory
             tempfile_fd.write(to_bytes(content))
             tempfile_fd.flush()
 
-            yield tempfile_fd.name
+            try:
+                yield tempfile_fd.name
+            finally:
+                pass
 
 
 def write_json_test_results(
@@ -291,7 +300,7 @@ def write_text_test_results(category: ResultType, name: str, content: str) -> No
 
 
 @cache
-def get_injector_path() -> str:
+def get_python_injector_path() -> str:
     """Return the path to a directory which contains a `python.py` executable and associated injector scripts."""
     injector_path = tempfile.mkdtemp(prefix='ansible-test-', suffix='-injector', dir='/tmp')
 
@@ -300,6 +309,7 @@ def get_injector_path() -> str:
     injector_names = sorted(list(ANSIBLE_BIN_SYMLINK_MAP) + [
         'importer.py',
         'pytest',
+        'ansible_connection_cli_stub.py',
     ])
 
     scripts = (
@@ -358,18 +368,28 @@ def set_shebang(script: str, executable: str) -> str:
 
 def get_python_path(interpreter: str) -> str:
     """Return the path to a directory which contains a `python` executable that runs the specified interpreter."""
-    python_path = PYTHON_PATHS.get(interpreter)
+    return get_injection_wrapper(interpreter, 'python', PYTHON_PATHS)
 
-    if python_path:
-        return python_path
 
-    prefix = 'python-'
+def get_powershell_path(interpreter: str) -> str:
+    """Return the path to a directory which contains a `pwsh` executable that runs the specified interpreter."""
+    return get_injection_wrapper(interpreter, 'pwsh', POWERSHELL_PATHS)
+
+
+def get_injection_wrapper(interpreter: str, name: str, cached_paths: dict[str, str]) -> str:
+    """Return the path to a directory which contains the named executable that runs the specified interpreter."""
+    injected_path = cached_paths.get(interpreter)
+
+    if injected_path:
+        return injected_path
+
+    prefix = f'{name}-'
     suffix = '-ansible'
 
     root_temp_dir = '/tmp'
 
-    python_path = tempfile.mkdtemp(prefix=prefix, suffix=suffix, dir=root_temp_dir)
-    injected_interpreter = os.path.join(python_path, 'python')
+    injected_path = tempfile.mkdtemp(prefix=prefix, suffix=suffix, dir=root_temp_dir)
+    injected_interpreter = os.path.join(injected_path, name)
 
     # A symlink is faster than the execv wrapper, but isn't guaranteed to provide the correct result.
     # There are several scenarios known not to work with symlinks:
@@ -383,14 +403,14 @@ def get_python_path(interpreter: str) -> str:
 
     create_interpreter_wrapper(interpreter, injected_interpreter)
 
-    verified_chmod(python_path, MODE_DIRECTORY)
+    verified_chmod(injected_path, MODE_DIRECTORY)
 
-    if not PYTHON_PATHS:
-        ExitHandler.register(cleanup_python_paths)
+    if not cached_paths:
+        ExitHandler.register(functools.partial(cleanup_injector_paths, cached_paths))
 
-    PYTHON_PATHS[interpreter] = python_path
+    cached_paths[interpreter] = injected_path
 
-    return python_path
+    return injected_path
 
 
 def create_temp_dir(prefix: t.Optional[str] = None, suffix: t.Optional[str] = None, base_dir: t.Optional[str] = None) -> str:
@@ -401,33 +421,33 @@ def create_temp_dir(prefix: t.Optional[str] = None, suffix: t.Optional[str] = No
 
 
 def create_interpreter_wrapper(interpreter: str, injected_interpreter: str) -> None:
-    """Create a wrapper for the given Python interpreter at the specified path."""
+    """Create a wrapper for the given interpreter at the specified path."""
     # sys.executable is used for the shebang to guarantee it is a binary instead of a script
     # injected_interpreter could be a script from the system or our own wrapper created for the --venv option
     shebang_interpreter = sys.executable
 
-    code = textwrap.dedent('''
-    #!%s
+    code = textwrap.dedent(f"""
+    #!{shebang_interpreter}
 
-    from __future__ import absolute_import
+    from __future__ import annotations
 
     from os import execv
     from sys import argv
 
-    python = '%s'
+    interpreter = {interpreter!r}
 
-    execv(python, [python] + argv[1:])
-    ''' % (shebang_interpreter, interpreter)).lstrip()
+    execv(interpreter, [interpreter] + argv[1:])
+    """).lstrip()
 
     write_text_file(injected_interpreter, code)
 
     verified_chmod(injected_interpreter, MODE_FILE_EXECUTE)
 
 
-def cleanup_python_paths() -> None:
-    """Clean up all temporary python directories."""
-    for path in sorted(PYTHON_PATHS.values()):
-        display.info('Cleaning up temporary python directory: %s' % path, verbosity=2)
+def cleanup_injector_paths(cached_paths: dict[str, str]) -> None:
+    """Clean up all temporary injector directories."""
+    for path in sorted(cached_paths.values()):
+        display.info(f'Cleaning up temporary injector directory: {path}', verbosity=2)
         remove_tree(path)
 
 
@@ -444,11 +464,21 @@ def intercept_python(
     """
     Run a command while intercepting invocations of Python to control the version used.
     If the specified Python is an ansible-test managed virtual environment, it will be added to PATH to activate it.
-    Otherwise a temporary directory will be created to ensure the correct Python can be found in PATH.
+    Otherwise, a temporary directory will be created to ensure the correct Python can be found in PATH.
     """
-    env = env.copy()
     cmd = list(cmd)
-    inject_path = get_injector_path()
+    env = get_python_injector_env(python, env)
+
+    return run_command(args, cmd, capture=capture, env=env, data=data, cwd=cwd, always=always)
+
+
+def get_python_injector_env(
+    python: PythonConfig,
+    env: dict[str, str],
+) -> dict[str, str]:
+    """Get the environment variables needed to inject the given Python interpreter into the environment."""
+    env = env.copy()
+    inject_path = get_python_injector_path()
 
     # make sure scripts (including injector.py) find the correct Python interpreter
     if isinstance(python, VirtualPythonConfig):
@@ -460,7 +490,25 @@ def intercept_python(
     env['ANSIBLE_TEST_PYTHON_VERSION'] = python.version
     env['ANSIBLE_TEST_PYTHON_INTERPRETER'] = python.path
 
-    return run_command(args, cmd, capture=capture, env=env, data=data, cwd=cwd, always=always)
+    return env
+
+
+def get_powershell_injector_env(
+    powershell: PowerShellConfig | None,
+    env: dict[str, str],
+) -> dict[str, str]:
+    """Get the environment variables needed to inject the given PowerShell interpreter into the environment."""
+    env = env.copy()
+
+    if not powershell or not powershell.path:
+        return env
+
+    powershell_path = get_powershell_path(powershell.path)
+
+    env['PATH'] = os.path.pathsep.join([powershell_path, env['PATH']])
+    env['ANSIBLE_TEST_POWERSHELL_INTERPRETER'] = powershell.path
+
+    return env
 
 
 def run_command(
@@ -498,9 +546,14 @@ def run_command(
     )
 
 
-def yamlcheck(python: PythonConfig) -> t.Optional[bool]:
+def yamlcheck(python: PythonConfig, explain: bool = False) -> t.Optional[bool]:
     """Return True if PyYAML has libyaml support, False if it does not and None if it was not found."""
-    result = json.loads(raw_command([python.path, os.path.join(ANSIBLE_TEST_TARGET_TOOLS_ROOT, 'yamlcheck.py')], capture=True)[0])
+    stdout = raw_command([python.path, os.path.join(ANSIBLE_TEST_TARGET_TOOLS_ROOT, 'yamlcheck.py')], capture=True, explain=explain)[0]
+
+    if explain:
+        return None
+
+    result = json.loads(stdout)
 
     if not result['yaml']:
         return None

@@ -1,4 +1,5 @@
 """Sanity test for symlinks in the bin directory."""
+
 from __future__ import annotations
 
 import os
@@ -32,7 +33,7 @@ from ...payload import (
 )
 
 from ...util import (
-    ANSIBLE_BIN_PATH,
+    ANSIBLE_SOURCE_ROOT,
 )
 
 
@@ -52,7 +53,7 @@ class BinSymlinksTest(SanityVersionNeutral):
         return True
 
     def test(self, args: SanityConfig, targets: SanityTargets) -> TestResult:
-        bin_root = ANSIBLE_BIN_PATH
+        bin_root = os.path.join(ANSIBLE_SOURCE_ROOT, 'bin')
         bin_names = os.listdir(bin_root)
         bin_paths = sorted(os.path.join(bin_root, path) for path in bin_names)
 

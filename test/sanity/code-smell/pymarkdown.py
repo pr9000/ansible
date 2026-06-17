@@ -1,4 +1,5 @@
 """Sanity test for Markdown files."""
+
 from __future__ import annotations
 
 import pathlib
@@ -14,8 +15,10 @@ def main() -> None:
 
     cmd = [
         sys.executable,
-        '-m', 'pymarkdown',
-        '--config', pathlib.Path(__file__).parent / 'pymarkdown.config.json',
+        '-m',
+        'pymarkdown',
+        '--config',
+        pathlib.Path(__file__).parent / 'pymarkdown.config.json',
         '--strict-config',
         'scan',
     ] + paths
@@ -35,9 +38,15 @@ def main() -> None:
     if not (stdout := process.stdout.strip()):
         return
 
-    pattern = re.compile(r'^(?P<path_line_column>[^:]*:[0-9]+:[0-9]+): (?P<code>[^:]*): (?P<message>.*) \((?P<aliases>.*)\)$')
+    pattern = re.compile(r'^(?P<path>[^:]*):(?P<line>[0-9]+):(?P<column>[0-9]+): (?P<code>[^:]*): (?P<message>.*) \((?P<aliases>.*)\)$')
     matches = parse_to_list_of_dict(pattern, stdout)
-    results = [f"{match['path_line_column']}: {match['aliases'].split(', ')[0]}: {match['message']}" for match in matches]
+
+    base_dir = pathlib.Path(__file__).parent.parent.parent.parent
+
+    for match in matches:
+        match['path'] = str(pathlib.Path(match['path']).relative_to(base_dir))
+
+    results = [f"{match['path']}:{match['line']}:{match['column']}: {match['aliases'].split(', ')[0]}: {match['message']}" for match in matches]
 
     print('\n'.join(results))
 
@@ -55,7 +64,7 @@ def parse_to_list_of_dict(pattern: re.Pattern, value: str) -> list[dict[str, t.A
             unmatched.append(line)
 
     if unmatched:
-        raise Exception('Pattern {pattern!r} did not match values:\n' + '\n'.join(unmatched))
+        raise Exception(f'Pattern {pattern!r} did not match values:\n' + '\n'.join(unmatched))
 
     return matched
 

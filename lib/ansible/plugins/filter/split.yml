@@ -1,6 +1,6 @@
 DOCUMENTATION:
   name: split
-  version_added: "historical"
+  version_added: 2.11
   short_description: split a string into a list
   description:
     - Using Python's text object method C(split) we turn strings into lists via a 'splitting character'.
@@ -22,7 +22,7 @@ EXAMPLES: |
     # listjojo => [ "jojo", "is", "a" ]
     listjojo: "{{ 'jojo is a' | split }}"
 
-    # listjojocomma => [ "jojo is", "a" ]
+    # listjojocomma => [ "jojo is", " a" ]
     listjojocomma: "{{ 'jojo is, a' | split(',') }}"
 
 RETURN:
